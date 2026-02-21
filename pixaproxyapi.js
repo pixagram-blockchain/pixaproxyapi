@@ -323,7 +323,7 @@ const CONFIG = {
     PIN_TIMEOUT: 5 * 60 * 1000,
     MIN_PIN_LENGTH: 6,
     DEFAULT_NODES: [
-        'https://cors-header-proxy-with-api.omnibus-39a.workers.dev'
+        'https://pixagram.dev'
     ],
     APP_NAME: 'pixagram/3.4.0',
     PAGINATION_LIMIT: 20,
@@ -590,6 +590,7 @@ export class PixaProxyAPI {
             this.transaction = new TransactionStatusAPI(this);
 
             this.keyManager = new KeyManager(this.eventEmitter, this.config);
+            this.keyManager._unlockWithPin = this.unlockWithPin.bind(this);
             await this.keyManager.setDependencies(this.settingsDb);
             this.cacheManager = new CacheManager(this.cacheDb);
             this.sessionManager = new SessionManager(this.settingsDb, this.config);
@@ -688,7 +689,7 @@ export class PixaProxyAPI {
         if (options.pinTimeout) this.config.PIN_TIMEOUT = options.pinTimeout;
 
         try {
-            const iterations = options.fastMode === true ? 5000 : (options.iterations || this.config.PBKDF2_ITERATIONS);
+            const iterations = this.config.PBKDF2_ITERATIONS;
 
             try { await this.settingsDb.createCollection('vault_config'); } catch (e) {}
             const saltCollection = await this.settingsDb.getCollection('vault_config');
@@ -709,6 +710,19 @@ export class PixaProxyAPI {
                 }
             }
 
+            // FIX: When doing a fresh vault creation (not fastMode/unlock),
+            // clear any stale vault database and encryption metadata from
+            // a previous session. Without this, _initializeEncryption finds
+            // old wrapped-key metadata in localStorage and tries to decrypt
+            // it with the new PIN, which fails with "Invalid PIN or corrupted key data".
+            if (!options.fastMode && !this.vaultInitialized) {
+                try {
+                    await this.lacerta.dropDatabase('pixa_vault');
+                } catch (dropErr) {
+                    // Ignore - database may not exist yet
+                }
+            }
+
             this.vaultDb = await this.lacerta.getSecureDatabase(
                 'pixa_vault', pin, existingSalt,
                 {
@@ -723,10 +737,42 @@ export class PixaProxyAPI {
             await this.setupVaultCollections();
             await this.keyManager.setVault(this.vaultDb);
 
+            // Store PIN verification token (HMAC of known plaintext)
+            // Used by unlockWithPin to detect wrong PINs without reading vault data
+            try {
+                const verifyHash = await this._derivePinVerifyHash(pin, existingSalt);
+                try {
+                    await saltCollection.add({ hash: verifyHash, created_at: Date.now() }, { id: 'pin_verify' });
+                } catch (e) {
+                    await saltCollection.update('pin_verify', { hash: verifyHash, updated_at: Date.now() });
+                }
+            } catch (e) {
+                console.warn('[initializeVault] Could not store PIN verify token:', e);
+            }
+
             this.keyManager.setPinTimeout(this.config.PIN_TIMEOUT);
-            this.keyManager.pinVerified = true;
-            this.keyManager.pinVerificationTime = Date.now();
+            await this.keyManager._generateSessionCryptoKey();
+            this.keyManager.resetPinTimer();
             this.vaultInitialized = true;
+
+            // Migrate any existing in-memory or unencrypted keys into the vault.
+            // This covers the case where the user did quickLogin first (keys in
+            // unencrypted store / sessionKeys) and then set up a vault later.
+            // SKIP in fastMode — fastMode is used by unlockWithPin to open an
+            // existing vault; migration there is handled separately to avoid
+            // double-writes and TurboSerial deserialization errors in LacertaDB's
+            // encrypted vault update path.
+            if (!options.fastMode) {
+                const activeAccount = this.keyManager.activeAccount ||
+                    (this.sessionManager && await this.sessionManager.getActiveAccount());
+                if (activeAccount) {
+                    try {
+                        await this.keyManager.migrateKeysToVault(activeAccount);
+                    } catch (migrationErr) {
+                        console.warn('[initializeVault] Key migration warning:', migrationErr.message);
+                    }
+                }
+            }
 
             this.eventEmitter.emit('vault_initialized', { timestamp: Date.now() });
             return true;
@@ -736,6 +782,33 @@ export class PixaProxyAPI {
     }
 
     isVaultInitialized() { return this.vaultInitialized; }
+
+    /**
+     * Derive a verification hash from PIN + salt using PBKDF2.
+     * This is a SEPARATE derivation from the vault encryption key
+     * (different purpose string) so it doesn't leak the vault key.
+     * @param {string} pin
+     * @param {string} salt - hex-encoded salt
+     * @returns {Promise<string>} base64-encoded verification hash
+     */
+    async _derivePinVerifyHash(pin, salt) {
+        const encoder = new TextEncoder();
+        const keyMaterial = await crypto.subtle.importKey(
+            'raw', encoder.encode(pin),
+            { name: 'PBKDF2' }, false, ['deriveBits']
+        );
+        const bits = await crypto.subtle.deriveBits(
+            {
+                name: 'PBKDF2',
+                salt: encoder.encode(salt + '_pin_verify'),
+                iterations: this.config.PBKDF2_ITERATIONS,
+                hash: 'SHA-256'
+            },
+            keyMaterial,
+            256
+        );
+        return btoa(String.fromCharCode(...new Uint8Array(bits)));
+    }
 
     async unlockWithPin(pin, options = {}) {
         const { keyType = 'posting', account } = options;
@@ -768,6 +841,7 @@ export class PixaProxyAPI {
                     return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
                 }
             } else {
+                // Vault already initialized — verify the PIN before accepting it
                 try {
                     const saltCollection = await this.settingsDb.getCollection('vault_config');
                     const saltDoc = await saltCollection.get('vault_salt');
@@ -776,38 +850,141 @@ export class PixaProxyAPI {
                         return { success: false, error: 'Vault configuration missing', code: 'VAULT_CONFIG_MISSING' };
                     }
 
-                    const testVault = await this.lacerta.getSecureDatabase(
-                        'pixa_vault', pin, saltDoc.salt,
-                        { iterations: 5000, hashAlgorithm: 'SHA-512', keyLength: 256, saltLength: 64 }
-                    );
+                    // Try stored verification hash first (fast path)
+                    let pinValid = false;
+                    try {
+                        const verifyDoc = await saltCollection.get('pin_verify');
+                        if (verifyDoc && verifyDoc.hash) {
+                            const enteredHash = await this._derivePinVerifyHash(pin, saltDoc.salt);
+                            if (enteredHash !== verifyDoc.hash) {
+                                return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
+                            }
+                            pinValid = true;
+                        }
+                    } catch (e) {
+                        // pin_verify doc doesn't exist (old vault) — fall through to vault-read verification
+                    }
 
-                    this.keyManager.pinVerified = true;
-                    this.keyManager.pinVerificationTime = Date.now();
+                    if (!pinValid) {
+                        // Old vault without verify token: open vault with entered PIN and try to read
+                        // If wrong PIN → encrypted data won't decrypt → reads will fail or return null
+                        try {
+                            const testVault = await this.lacerta.getSecureDatabase(
+                                'pixa_vault', pin, saltDoc.salt,
+                                { iterations: this.config.PBKDF2_ITERATIONS, hashAlgorithm: 'SHA-512', keyLength: 256, saltLength: 64 }
+                            );
+                            // Try to actually read data — wrong key won't decrypt
+                            const testCollection = await testVault.getCollection('master_keys');
+                            const testRead = await testCollection.get(normalizedAccount);
+                            // testRead MUST be non-null with actual keys — if null, the PIN
+                            // decrypted to garbage or the wrong encryption context was used.
+                            // Lacerta may not throw on wrong PIN; it just returns empty/null.
+                            if (!testRead || !testRead.derived_keys) {
+                                // No master keys found — also try individual keys before rejecting.
+                                // User might have logged in with individual key, not master.
+                                try {
+                                    const testIndCollection = await testVault.getCollection('individual_keys');
+                                    const testIndRead = await testIndCollection.get(`${normalizedAccount}_posting`);
+                                    if (!testIndRead || !testIndRead.key) {
+                                        // Neither master nor individual keys found → wrong PIN
+                                        return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
+                                    }
+                                } catch (indErr) {
+                                    return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
+                                }
+                            }
+                            pinValid = true;
+
+                            // Do NOT backfill pin_verify from the fallback path — the PIN
+                            // was only weakly verified. pin_verify will be stored on the
+                            // next full initializeVault call.
+                        } catch (e) {
+                            return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
+                        }
+                    }
+
+                    // PIN verified — ALWAYS refresh vault handles to ensure they're
+                    // using the correct encryption context. Stale handles from the
+                    // original login may have been garbage-collected or may point to
+                    // a different encryption context after tab sleep/wake.
+                    try {
+                        await this.keyManager.setVault(this.vaultDb);
+                    } catch (e) {
+                        // vaultDb handle may be stale; re-open with verified PIN
+                        try {
+                            this.vaultDb = await this.lacerta.getSecureDatabase(
+                                'pixa_vault', pin, saltDoc.salt,
+                                { iterations: this.config.PBKDF2_ITERATIONS, hashAlgorithm: 'SHA-512', keyLength: 256, saltLength: 64 }
+                            );
+                            await this.setupVaultCollections();
+                            await this.keyManager.setVault(this.vaultDb);
+                        } catch (e2) {
+                            return { success: false, error: 'Vault access failed', code: 'VAULT_STALE' };
+                        }
+                    }
                 } catch (e) {
                     return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
                 }
             }
 
-            this.keyManager.pinVerified = true;
-            this.keyManager.pinVerificationTime = Date.now();
+            // Ensure session crypto key exists for in-memory encryption
+            if (!this.keyManager._sessionCryptoKey) {
+                await this.keyManager._generateSessionCryptoKey();
+            }
+            this.keyManager.resetPinTimer();
 
             // Update session last activity
             await this.sessionManager.updateSession({ last_pin_unlock: Date.now() });
 
-            if (keyType && this.keyManager.vaultMaster) {
+            // Load keys from vault into session cache
+            let keysLoaded = false;
+            if (this.keyManager.vaultMaster) {
                 try {
                     const master = await this.keyManager.vaultMaster.get(normalizedAccount);
                     if (master && master.derived_keys) {
-                        this.keyManager.cacheKeys(normalizedAccount, master.derived_keys);
+                        await this.keyManager.cacheKeys(normalizedAccount, master.derived_keys);
+                        keysLoaded = true;
                     }
                 } catch (e) {
-                    try {
-                        const indKey = await this.keyManager.vaultIndividual.get(`${normalizedAccount}_${keyType}`);
-                        if (indKey && indKey.key) {
-                            this.keyManager.sessionKeys.set(`${normalizedAccount}_${keyType}`, indKey.key);
-                        }
-                    } catch (e2) {}
+                    console.warn('[unlockWithPin] Failed to read master keys from vault:', e.message);
                 }
+            }
+
+            if (!keysLoaded && this.keyManager.vaultIndividual && keyType) {
+                try {
+                    const indKey = await this.keyManager.vaultIndividual.get(`${normalizedAccount}_${keyType}`);
+                    if (indKey && indKey.key) {
+                        await this.keyManager.addIndividualKey(normalizedAccount, keyType, indKey.key, { storeInVault: false });
+                        keysLoaded = true;
+                    }
+                } catch (e) {
+                    console.warn('[unlockWithPin] Failed to read individual key from vault:', e.message);
+                }
+            }
+
+            // Fallback: try the unencrypted collection (keys from quickLogin or
+            // previous sessions that weren't migrated to the vault yet).
+            // Load into in-memory cache only — do NOT attempt vault migration here.
+            // LacertaDB's encrypted vault update/add can fail with TurboSerial
+            // deserialization errors when the vault was opened via fastMode.
+            // Keys will be migrated properly on the next full initializeVault call.
+            if (!keysLoaded && this.keyManager.unencrypted) {
+                try {
+                    const hasUnencrypted = await this.keyManager.loadUnencryptedKeys(normalizedAccount);
+                    if (hasUnencrypted) {
+                        console.log('[unlockWithPin] Loaded keys from unencrypted store (in-memory only)');
+                        keysLoaded = true;
+                    }
+                } catch (e) {
+                    console.warn('[unlockWithPin] Failed to load unencrypted keys:', e.message);
+                }
+            }
+
+            if (!keysLoaded) {
+                // PIN was correct but keys could not be loaded — don't claim success
+                this.keyManager.pinVerified = false;
+                this.keyManager.pinVerificationTime = 0;
+                return { success: false, error: 'Keys not found in vault', code: 'KEYS_NOT_FOUND' };
             }
 
             this.eventEmitter.emit('pin_unlocked', { account: normalizedAccount });
@@ -944,6 +1121,17 @@ export class PixaProxyAPI {
             await this.keyManager.addAccountWithMasterKey(normalizedAccount, key, { storeInVault: false });
         } else {
             await this.keyManager.addIndividualKey(normalizedAccount, keyType, key, { storeInVault: false });
+        }
+
+        // If vault is already initialized, also persist keys to the encrypted vault.
+        // This ensures that PIN unlock can recover them after in-memory cache expiry.
+        if (this.vaultInitialized && this.keyManager.vaultMaster) {
+            try {
+                await this.keyManager.migrateKeysToVault(normalizedAccount);
+                console.log('[quickLogin] Keys also persisted to vault');
+            } catch (e) {
+                console.warn('[quickLogin] Could not persist keys to vault:', e.message);
+            }
         }
 
         let sessionId = null;
@@ -4383,10 +4571,200 @@ class KeyManager {
         this.activeAccount = null;
         this.pinVerified = false;
         this.pinVerificationTime = 0;
+        /** @private AES-GCM CryptoKey for in-memory key encryption (non-extractable, memory-only) */
+        this._sessionCryptoKey = null;
+        /** @private Bound cleanup handler for tab-close events */
+        this._cleanupBound = null;
+        /** @private Reference to the proxy's unlockWithPin for PIN re-verification */
+        this._unlockWithPin = null;
     }
 
     setPinTimeout(timeout) {
         if (this.config) { this.config.PIN_TIMEOUT = timeout; }
+    }
+
+    /**
+     * Reset the PIN verification timer. Called from all paths that verify
+     * the PIN or accept a raw key — ensures keys stay in-memory for the
+     * full PIN_TIMEOUT duration from this moment.
+     */
+    resetPinTimer() {
+        this.pinVerified = true;
+        this.pinVerificationTime = Date.now();
+    }
+
+    /**
+     * Migrate keys currently in sessionKeys (in-memory) and/or in the
+     * unencrypted collection into the encrypted vault.  Called after vault
+     * creation to ensure keys from a prior quickLogin are persisted.
+     * @param {string} account - normalized account name
+     */
+    async migrateKeysToVault(account) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return;
+
+        const types = ['posting', 'active', 'owner', 'memo'];
+        // Track which individual keys have already been written to vault
+        // to avoid double-writes (section 1 from unencrypted, section 2 from sessionKeys).
+        // LacertaDB's encrypted vault `update` path can fail with TurboSerial
+        // deserialization errors, so we use add-only and silently skip conflicts.
+        const writtenKeys = new Set();
+
+        // 1. Try to migrate from unencrypted DB → vault
+        if (this.unencrypted) {
+            // Master keys (all 4 derived from master password)
+            try {
+                const masterDoc = await this.unencrypted.get(normalizedAccount);
+                if (masterDoc && masterDoc.derived_keys) {
+                    if (this.vaultMaster) {
+                        try {
+                            await this.vaultMaster.add(
+                                { account: normalizedAccount, derived_keys: masterDoc.derived_keys, created_at: Date.now() },
+                                { id: normalizedAccount }
+                            );
+                            console.log('[migrateKeysToVault] Migrated master keys to vault for', normalizedAccount);
+                        } catch (e) {
+                            // Already exists — skip (don't use update — it triggers TurboSerial errors)
+                            console.log('[migrateKeysToVault] Master keys already in vault for', normalizedAccount);
+                        }
+                        // Mark all types as written (master key derives all 4)
+                        types.forEach(t => writtenKeys.add(`${normalizedAccount}_${t}`));
+                    }
+                    // Also ensure they're in the in-memory cache
+                    await this.cacheKeys(normalizedAccount, masterDoc.derived_keys);
+                }
+            } catch (e) { /* no master doc */ }
+
+            // Individual keys
+            for (const type of types) {
+                const id = `${normalizedAccount}_${type}`;
+                if (writtenKeys.has(id)) continue; // Already handled by master keys
+                try {
+                    const doc = await this.unencrypted.get(id);
+                    if (doc && doc.key && this.vaultIndividual) {
+                        try {
+                            await this.vaultIndividual.add(
+                                { account: normalizedAccount, type, key: doc.key, created_at: Date.now() },
+                                { id }
+                            );
+                            console.log(`[migrateKeysToVault] Migrated ${type} key to vault for`, normalizedAccount);
+                        } catch (e) {
+                            // Already exists — skip
+                        }
+                        writtenKeys.add(id);
+                    }
+                } catch (e) { /* no individual doc */ }
+            }
+        }
+
+        // 2. Migrate from sessionKeys → vault (keys that were only in-memory)
+        for (const type of types) {
+            const cacheKey = `${normalizedAccount}_${type}`;
+            if (writtenKeys.has(cacheKey)) continue; // Already migrated above
+
+            const entry = this.sessionKeys.get(cacheKey);
+            if (!entry) continue;
+
+            const plainKey = await this._decryptFromCache(entry);
+            if (!plainKey) continue;
+
+            if (this.vaultIndividual) {
+                try {
+                    await this.vaultIndividual.add(
+                        { account: normalizedAccount, type, key: plainKey, created_at: Date.now() },
+                        { id: cacheKey }
+                    );
+                    console.log(`[migrateKeysToVault] Migrated ${type} key (from session) to vault for`, normalizedAccount);
+                } catch (e) {
+                    // Already exists — skip (add-only, no update)
+                }
+            }
+        }
+    }
+
+    /**
+     * Generate a random AES-GCM CryptoKey for encrypting session keys in memory.
+     * The key is non-extractable and lives only in JS heap — it cannot be
+     * serialized, persisted, or read from devtools. When the tab closes or the
+     * PIN expires, it is destroyed and the encrypted blobs become unrecoverable.
+     */
+    async _generateSessionCryptoKey() {
+        // Destroy any existing key first
+        this._destroySessionCrypto(false);
+
+        this._sessionCryptoKey = await crypto.subtle.generateKey(
+            { name: 'AES-GCM', length: 256 },
+            false, // non-extractable
+            ['encrypt', 'decrypt']
+        );
+
+        // Register tab-close cleanup
+        if (typeof globalThis !== 'undefined' && globalThis.addEventListener) {
+            this._cleanupBound = () => this._destroySessionCrypto(true);
+            globalThis.addEventListener('pagehide', this._cleanupBound);
+            globalThis.addEventListener('beforeunload', this._cleanupBound);
+        }
+    }
+
+    /**
+     * Encrypt a plaintext key for in-memory storage.
+     * Falls back to plaintext if no session CryptoKey (quickLogin path).
+     * @param {string} plaintext - The private key string
+     * @returns {Promise<object|string>} Encrypted blob {_enc, iv, ct} or plaintext
+     */
+    async _encryptForCache(plaintext) {
+        if (!this._sessionCryptoKey) return plaintext;
+        const encoder = new TextEncoder();
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv },
+            this._sessionCryptoKey,
+            encoder.encode(plaintext)
+        );
+        return { _enc: true, iv, ct };
+    }
+
+    /**
+     * Decrypt a cached key blob back to plaintext.
+     * Returns plaintext strings as-is (quickLogin keys).
+     * Returns null if CryptoKey has been destroyed (expired/tab closed).
+     * @param {object|string} blob - Encrypted blob or plaintext string
+     * @returns {Promise<string|null>} Decrypted key or null
+     */
+    async _decryptFromCache(blob) {
+        if (!blob) return null;
+        if (typeof blob === 'string') return blob; // plaintext (quickLogin)
+        if (!blob._enc) return null;
+        if (!this._sessionCryptoKey) return null; // CryptoKey destroyed
+        try {
+            const plaintext = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: blob.iv },
+                this._sessionCryptoKey,
+                blob.ct
+            );
+            return new TextDecoder().decode(plaintext);
+        } catch (e) {
+            return null; // decryption failed — key was likely destroyed
+        }
+    }
+
+    /**
+     * Destroy the session CryptoKey and wipe all encrypted cached keys.
+     * Called on PIN expiry, tab close, and explicit lock.
+     * @param {boolean} clearKeys - Whether to also clear the sessionKeys Map
+     */
+    _destroySessionCrypto(clearKeys = true) {
+        this._sessionCryptoKey = null;
+        if (clearKeys) {
+            this.sessionKeys.clear();
+            this.pinVerified = false;
+            this.pinVerificationTime = 0;
+        }
+        if (this._cleanupBound && typeof globalThis !== 'undefined' && globalThis.removeEventListener) {
+            globalThis.removeEventListener('pagehide', this._cleanupBound);
+            globalThis.removeEventListener('beforeunload', this._cleanupBound);
+            this._cleanupBound = null;
+        }
     }
 
     async setDependencies(settingsDb) {
@@ -4406,8 +4784,8 @@ class KeyManager {
 
     async unlockVault(pin) {
         try {
-            this.pinVerified = true;
-            this.pinVerificationTime = Date.now();
+            await this._generateSessionCryptoKey();
+            this.resetPinTimer();
             try { await this.vaultDbReference.createCollection('master_keys'); } catch(e){}
             try { await this.vaultDbReference.createCollection('individual_keys'); } catch(e){}
             this.vaultMaster = await this.vaultDbReference.getCollection('master_keys');
@@ -4421,24 +4799,28 @@ class KeyManager {
     }
 
     async lock() {
-        this.pinVerified = false;
-        this.pinVerificationTime = 0;
-        this.sessionKeys.clear();
+        this._destroySessionCrypto(true);
         this.vaultMaster = null;
         this.vaultIndividual = null;
     }
 
     isPINValid() {
-        if (!this.pinVerified) return false;
+        if (!this.pinVerified || this.pinVerificationTime <= 0) return false;
         const timeout = this.config.PIN_TIMEOUT || 15 * 60 * 1000;
-        return (Date.now() - this.pinVerificationTime) < timeout;
+        if ((Date.now() - this.pinVerificationTime) >= timeout) {
+            // PIN expired — destroy CryptoKey and wipe all cached keys
+            this._destroySessionCrypto(true);
+            return false;
+        }
+        return true;
     }
 
-    cacheKeys(account, keys) {
+    async cacheKeys(account, keys) {
         const normalizedAccount = normalizeAccount(account);
         if (!normalizedAccount) return;
         for (const [type, key] of Object.entries(keys)) {
-            this.sessionKeys.set(`${normalizedAccount}_${type}`, key);
+            const stored = await this._encryptForCache(key);
+            this.sessionKeys.set(`${normalizedAccount}_${type}`, stored);
         }
     }
 
@@ -4446,14 +4828,24 @@ class KeyManager {
         const normalizedAccount = normalizeAccount(account);
         if (!normalizedAccount) throw new KeyNotFoundError(account, type);
 
-        const sessionKey = this.sessionKeys.get(`${normalizedAccount}_${type}`);
-        if (sessionKey) return sessionKey;
+        const sessionEntry = this.sessionKeys.get(`${normalizedAccount}_${type}`);
+        if (sessionEntry) {
+            // If PIN was used but has expired, destroy crypto and deny
+            if (this.pinVerificationTime > 0 && !this.isPINValid()) {
+                // isPINValid() auto-destroys; fall through to vault/PIN check
+            } else {
+                const decrypted = await this._decryptFromCache(sessionEntry);
+                if (decrypted) return decrypted;
+                // Decryption failed (CryptoKey gone) — clear stale entry
+                this.sessionKeys.delete(`${normalizedAccount}_${type}`);
+            }
+        }
 
         if (this.vaultMaster && this.isPINValid()) {
             try {
                 const master = await this.vaultMaster.get(normalizedAccount);
                 if (master && master.derived_keys && master.derived_keys[type]) {
-                    this.cacheKeys(normalizedAccount, master.derived_keys);
+                    await this.cacheKeys(normalizedAccount, master.derived_keys);
                     return master.derived_keys[type];
                 }
             } catch (e) {}
@@ -4463,10 +4855,110 @@ class KeyManager {
             try {
                 const indKey = await this.vaultIndividual.get(`${normalizedAccount}_${type}`);
                 if (indKey && indKey.key) {
-                    this.sessionKeys.set(`${normalizedAccount}_${type}`, indKey.key);
+                    const stored = await this._encryptForCache(indKey.key);
+                    this.sessionKeys.set(`${normalizedAccount}_${type}`, stored);
                     return indKey.key;
                 }
             } catch (e) {}
+        }
+
+        // If vault is configured but PIN has expired, request PIN unlock
+        // instead of asking for the raw private key
+        if (this.vaultDbReference && !this.isPINValid()) {
+            return new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                    reject(new KeyNotFoundError(normalizedAccount, type));
+                }, 120000); // 2 minutes to allow retries
+
+                const emitData = {
+                    account: normalizedAccount,
+                    type,
+                    reason: `PIN required for ${type} operation`,
+                    callback: null, // pinCallback — set below
+                    keyCallback: null // keyCallback — set below (Enter Key path)
+                };
+
+                // PIN callback: UI provides the PIN, we verify + unlock + retry key fetch.
+                // On wrong PIN: throws so UI shows "Incorrect PIN"; dialog stays open for retry.
+                // On correct PIN: resolves the outer Promise with the decrypted key.
+                // On hard failure: rejects the outer Promise.
+                const pinCallback = async (pin) => {
+                    if (!this._unlockWithPin) {
+                        clearTimeout(timeout);
+                        reject(new Error('PIN unlock not available'));
+                        return;
+                    }
+
+                    const unlockResult = await this._unlockWithPin(pin, {
+                        account: normalizedAccount,
+                        keyType: type
+                    });
+
+                    if (!unlockResult.success) {
+                        // Wrong PIN — throw so the UI handler's catch shows "Incorrect PIN"
+                        // snackbar. The dialog stays open and the user can retry.
+                        throw new Error(unlockResult.error || 'Incorrect PIN');
+                    }
+
+                    // PIN verified and keys loaded — clear the timeout
+                    clearTimeout(timeout);
+
+                    // Read the key from cache (unlockWithPin should have loaded it)
+                    const cachedEntry = this.sessionKeys.get(`${normalizedAccount}_${type}`);
+                    if (cachedEntry) {
+                        const decrypted = await this._decryptFromCache(cachedEntry);
+                        if (decrypted) {
+                            resolve(decrypted);
+                            return;
+                        }
+                    }
+
+                    // Fallback: try vault read directly
+                    if (this.vaultMaster && this.isPINValid()) {
+                        try {
+                            const master = await this.vaultMaster.get(normalizedAccount);
+                            if (master && master.derived_keys && master.derived_keys[type]) {
+                                await this.cacheKeys(normalizedAccount, master.derived_keys);
+                                resolve(master.derived_keys[type]);
+                                return;
+                            }
+                        } catch (e) {}
+                    }
+
+                    if (this.vaultIndividual && this.isPINValid()) {
+                        try {
+                            const indKey = await this.vaultIndividual.get(`${normalizedAccount}_${type}`);
+                            if (indKey && indKey.key) {
+                                const stored = await this._encryptForCache(indKey.key);
+                                this.sessionKeys.set(`${normalizedAccount}_${type}`, stored);
+                                resolve(indKey.key);
+                                return;
+                            }
+                        } catch (e) {}
+                    }
+
+                    // PIN was correct but key not found — hard failure
+                    reject(new KeyNotFoundError(normalizedAccount, type));
+                };
+
+                // Key callback: UI provides a raw private key directly.
+                // UnlockKeyDialog already validates, caches (encrypted), and
+                // resets the PIN timer before invoking this callback.
+                // We just need to resolve the pending requestKey Promise.
+                const keyCallback = async (key) => {
+                    clearTimeout(timeout);
+                    // Ensure session crypto + PIN state is set (defense in depth)
+                    if (!this._sessionCryptoKey) {
+                        await this._generateSessionCryptoKey();
+                    }
+                    this.resetPinTimer();
+                    resolve(key);
+                };
+
+                emitData.callback = pinCallback;
+                emitData.keyCallback = keyCallback;
+                this.emitter.emit('pin_required', emitData);
+            });
         }
 
         return new Promise((resolve, reject) => {
@@ -4481,8 +4973,8 @@ class KeyManager {
                 clearTimeout(timeout);
                 try {
                     if (isMaster) {
-                        await this.addAccountWithMasterKey(normalizedAccount, key, { storeInVault: shouldStore });
-                        resolve(this.sessionKeys.get(`${normalizedAccount}_${type}`));
+                        const derivedKeys = await this.addAccountWithMasterKey(normalizedAccount, key, { storeInVault: shouldStore });
+                        resolve(derivedKeys[type]);
                     } else {
                         await this.addIndividualKey(normalizedAccount, type, key, { storeInVault: shouldStore });
                         resolve(key);
@@ -4499,8 +4991,8 @@ class KeyManager {
                 clearTimeout(timeout);
                 try {
                     if (typeof keyInput === 'object' && keyInput.masterPassword) {
-                        await this.addAccountWithMasterKey(normalizedAccount, keyInput.masterPassword, { storeInVault: keyInput.save });
-                        resolve(this.sessionKeys.get(`${normalizedAccount}_${type}`));
+                        const derivedKeys = await this.addAccountWithMasterKey(normalizedAccount, keyInput.masterPassword, { storeInVault: keyInput.save });
+                        resolve(derivedKeys[type]);
                     } else {
                         const keyValue = typeof keyInput === 'object' ? keyInput.key : keyInput;
                         const shouldSave = typeof keyInput === 'object' ? keyInput.save : false;
@@ -4523,19 +5015,25 @@ class KeyManager {
             memo: PrivateKey.fromLogin(normalizedAccount, masterPassword, 'memo').toString()
         };
 
-        this.cacheKeys(normalizedAccount, derivedKeys);
+        await this.cacheKeys(normalizedAccount, derivedKeys);
 
-        if (options.storeInVault && this.vaultMaster) {
-            try {
-                await this.vaultMaster.add({ account: normalizedAccount, derived_keys: derivedKeys, created_at: Date.now() }, { id: normalizedAccount });
-            } catch (e) {
-                await this.vaultMaster.update(normalizedAccount, { derived_keys: derivedKeys, updated_at: Date.now() });
-            }
-        } else if (!options.storeInVault && this.unencrypted) {
+        // ALWAYS store in unencrypted as the reliable ground-truth fallback.
+        // This ensures loadUnencryptedKeys() can always recover keys even if
+        // the encrypted vault reads fail (stale handles, TurboSerial errors, etc.)
+        if (this.unencrypted) {
             try {
                 await this.unencrypted.add({ account: normalizedAccount, derived_keys: derivedKeys, created_at: Date.now() }, { id: normalizedAccount });
             } catch (e) {
-                await this.unencrypted.update(normalizedAccount, { derived_keys: derivedKeys, updated_at: Date.now() });
+                try { await this.unencrypted.update(normalizedAccount, { derived_keys: derivedKeys, updated_at: Date.now() }); } catch (e2) { /* ignore */ }
+            }
+        }
+
+        // ALSO store in encrypted vault when available (belt-and-suspenders).
+        if (this.vaultMaster) {
+            try {
+                await this.vaultMaster.add({ account: normalizedAccount, derived_keys: derivedKeys, created_at: Date.now() }, { id: normalizedAccount });
+            } catch (e) {
+                // Already exists — skip (don't use update — encrypted vault update can fail)
             }
         }
 
@@ -4546,21 +5044,26 @@ class KeyManager {
         const normalizedAccount = normalizeAccount(account);
         if (!normalizedAccount) throw new Error('Invalid account');
 
-        this.sessionKeys.set(`${normalizedAccount}_${type}`, key);
+        const stored = await this._encryptForCache(key);
+        this.sessionKeys.set(`${normalizedAccount}_${type}`, stored);
 
+        // ALWAYS store in unencrypted as the reliable ground-truth fallback.
+        if (this.unencrypted) {
+            const id = `${normalizedAccount}_${type}`;
+            try {
+                await this.unencrypted.add({ account: normalizedAccount, type, key, created_at: Date.now() }, { id });
+            } catch (e) {
+                try { await this.unencrypted.update(id, { key, updated_at: Date.now() }); } catch (e2) { /* ignore */ }
+            }
+        }
+
+        // ALSO store in encrypted vault when requested and available.
         if (options.storeInVault && this.vaultIndividual) {
             const id = `${normalizedAccount}_${type}`;
             try {
                 await this.vaultIndividual.add({ account: normalizedAccount, type, key, created_at: Date.now() }, { id });
             } catch (e) {
-                await this.vaultIndividual.update(id, { key, updated_at: Date.now() });
-            }
-        } else if (!options.storeInVault && this.unencrypted) {
-            const id = `${normalizedAccount}_${type}`;
-            try {
-                await this.unencrypted.add({ account: normalizedAccount, type, key, created_at: Date.now() }, { id });
-            } catch (e) {
-                await this.unencrypted.update(id, { key, updated_at: Date.now() });
+                // Already exists — skip (don't use update — encrypted vault update can fail)
             }
         }
     }
@@ -4574,7 +5077,7 @@ class KeyManager {
         try {
             const data = await this.unencrypted.get(normalizedAccount);
             if (data && data.derived_keys) {
-                this.cacheKeys(normalizedAccount, data.derived_keys);
+                await this.cacheKeys(normalizedAccount, data.derived_keys);
                 foundAny = true;
             }
         } catch(e) {}
@@ -4585,7 +5088,8 @@ class KeyManager {
                 const id = `${normalizedAccount}_${type}`;
                 const data = await this.unencrypted.get(id);
                 if (data && data.key) {
-                    this.sessionKeys.set(id, data.key);
+                    const stored = await this._encryptForCache(data.key);
+                    this.sessionKeys.set(id, stored);
                     foundAny = true;
                 }
             } catch(e) {}
@@ -4594,10 +5098,8 @@ class KeyManager {
     }
 
     async clearAllSessions(clearStorage = false) {
-        this.sessionKeys.clear();
+        this._destroySessionCrypto(true);
         this.activeAccount = null;
-        this.pinVerified = false;
-        this.pinVerificationTime = 0;
         this.vaultMaster = null;
         this.vaultIndividual = null;
 
@@ -4616,13 +5118,27 @@ class KeyManager {
     hasKey(account, type) {
         const normalizedAccount = normalizeAccount(account);
         if (!normalizedAccount) return false;
+        // Trigger auto-cleanup if PIN expired (isPINValid auto-destroys)
+        if (this.pinVerificationTime > 0 && !this.isPINValid()) {
+            return false;
+        }
         return this.sessionKeys.has(`${normalizedAccount}_${type}`);
     }
 
+    /**
+     * @deprecated Use requestKey() instead — getKeySync cannot decrypt encrypted cache entries.
+     * Returns null for encrypted entries. Only works for plaintext (quickLogin) keys.
+     */
     getKeySync(account, type) {
         const normalizedAccount = normalizeAccount(account);
         if (!normalizedAccount) return null;
-        return this.sessionKeys.get(`${normalizedAccount}_${type}`) || null;
+        if (this.pinVerificationTime > 0 && !this.isPINValid()) {
+            return null;
+        }
+        const entry = this.sessionKeys.get(`${normalizedAccount}_${type}`);
+        // Only return plaintext entries; encrypted blobs require async decryption
+        if (entry && typeof entry === 'object' && entry._enc) return null;
+        return entry || null;
     }
 
     setActiveAccount(acc) {
