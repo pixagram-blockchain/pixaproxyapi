@@ -1,7 +1,29 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.4.0
+ * @version 3.5.0
+ *
+ * Changes in 3.5.0:
+ * - DANGEROUS FIELD SANITIZATION: `body`, `json_metadata`, `posting_json_metadata`
+ *   are parsed/sanitized at ingestion; only the safe output is persisted.
+ *   - `body` now contains sanitized HTML (not raw markdown). No `html`, `sanitizedBody`.
+ *   - `json_metadata` / `posting_json_metadata` keep their original field names but store
+ *     the WASM-parsed safe object (not the raw JSON string).
+ * - All ISO-8601 date fields are stored as integer millisecond timestamps
+ *   (direct `new Date(ts)` usage, efficient indexing and comparison).
+ * - Enrichment fields use underscore-prefixed keys at document root:
+ *   - Posts:    `_images`, `_links`, `_summary`, `_tags`, `_word_count`, `_app`
+ *   - Comments: `_images`, `_links`, `_word_count`
+ *   - Accounts: `_profile` (display_name, about, location, website, images), `_links`
+ * - Entity store collections have named indexes for efficient queries:
+ *   `accounts_store`, `posts_store`, `comments_store`, `query_cache`
+ * - Added missing API fields: authority objects (`owner`/`active`/`posting`),
+ *   `downvote_manabar`, power-down state, `cashout_time`, `active_votes`,
+ *   `allow_replies`, `root_author`/`root_permlink`, governance, and more.
+ * - Legacy fallbacks in formatAccount, processPost, processComment no longer use
+ *   `{ ...raw }` spread — all paths build entities field-by-field.
+ * - Removed redundant fields: `sanitizedBody`, `html`, `plainText`, `wordCount`,
+ *   `images`, `links`, `tags`, `app`, `parsed_metadata`, `sanitized_*`, `display_name`
  *
  * Changes in 3.4.0:
  * - Introduced entity-based storage architecture with separate DB stores:
@@ -260,10 +282,9 @@ import pixaContentInit, {
     extractPlainText as wasmExtractPlainText,
     summarizeContent as wasmSummarizeContent,
     parseMetadata as wasmParseMetadata,
-    parseProfile as wasmParseProfile,
     sanitizeBiography as wasmSanitizeBiography,
     sanitizeUsername as wasmSanitizeUsername,
-} from 'pixa-content';
+} from '@pixagram/sanitizer';
 import {
     Client,
     PrivateKey,
@@ -358,9 +379,17 @@ const VALIDATORS = {
         if (typeof s !== 'string') return null;
         return /^PIX[1-9A-HJ-NP-Za-km-z]{46,53}$/.test(s) ? s : null;
     },
-    safe_iso_date: (s) => {
-        if (typeof s !== 'string') return null;
-        return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(s) ? s : null;
+    /**
+     * Convert an ISO-8601 date string to a millisecond timestamp (integer).
+     * Returns 0 for invalid/missing dates so `new Date(ts)` always works.
+     * Blockchain dates are UTC with no trailing "Z" — we append it.
+     */
+    safe_timestamp: (s) => {
+        if (typeof s === 'number' && Number.isFinite(s)) return s;
+        if (typeof s !== 'string') return 0;
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(s)) return 0;
+        const ms = Date.parse(s.endsWith('Z') ? s : s + 'Z');
+        return Number.isFinite(ms) ? ms : 0;
     },
     safe_number: (v) => {
         return (typeof v === 'number' && Number.isFinite(v)) ? v : null;
@@ -397,6 +426,37 @@ const VALIDATORS = {
         return {
             current_mana: String(m.current_mana || '0'),
             last_update_time: VALIDATORS.safe_number(m.last_update_time) ?? 0,
+        };
+    },
+    /**
+     * Validate an Authority object { weight_threshold, account_auths, key_auths }.
+     * These are structured chain data — NOT user-supplied text.
+     */
+    safe_authority: (auth) => {
+        if (!auth || typeof auth !== 'object') return null;
+        return {
+            weight_threshold: VALIDATORS.safe_number(auth.weight_threshold) ?? 1,
+            account_auths: Array.isArray(auth.account_auths)
+                ? auth.account_auths.filter(a => Array.isArray(a) && a.length === 2 && typeof a[0] === 'string')
+                : [],
+            key_auths: Array.isArray(auth.key_auths)
+                ? auth.key_auths.filter(a => Array.isArray(a) && a.length === 2 && typeof a[0] === 'string')
+                : [],
+        };
+    },
+    /**
+     * Validate a single active_vote entry.
+     * { voter, weight, rshares, time } — voter is a username, rest are numbers/strings.
+     */
+    safe_active_vote: (v, sanitizeUsername) => {
+        if (!v || typeof v !== 'object') return null;
+        const voter = sanitizeUsername ? sanitizeUsername(v.voter) : VALIDATORS.safe_username_js(v.voter);
+        if (!voter) return null;
+        return {
+            voter,
+            weight:  VALIDATORS.safe_number(v.weight) ?? 0,
+            rshares: VALIDATORS.safe_numeric_string(String(v.rshares || '0')) || '0',
+            time:    VALIDATORS.safe_timestamp(v.time),
         };
     },
 };
@@ -682,7 +742,7 @@ export class PixaProxyAPI {
             this.queryCache = new QueryCacheManager(this.cacheDb, this.config.QUERY_TTL);
 
             this.initialized = true;
-            console.log('[PixaProxyAPI] Initialized successfully v3.4.0');
+            console.log('[PixaProxyAPI] Initialized successfully v3.5.0');
             return this;
         } catch (error) {
             console.error('[PixaProxyAPI] Initialization failed:', error);
@@ -1272,14 +1332,78 @@ export class PixaProxyAPI {
 
     async setupCollections() {
         const cacheCollections = [
-            'posts', 'accounts', 'comments', 'feed_cache', 'tags', 'blocks', 'market',
+            'posts', 'accounts', 'comments',
+            'feed_cache', 'tags', 'blocks', 'market',
             'witnesses', 'globals', 'relationships', 'rewards',
-            // Entity stores (v3.4.0)
-            'accounts_store', 'posts_store', 'comments_store', 'query_cache'
+            'accounts_store', 'posts_store', 'comments_store',
+            'query_cache'
         ];
         const settingsCollections = ['sessions', 'preferences', 'accounts_registry'];
         await this._setupCollectionGroup(this.cacheDb, cacheCollections, 'cache');
         await this._setupCollectionGroup(this.settingsDb, settingsCollections, 'settings');
+
+        // v3.5.0: Create indexes on entity store collections
+        await this._setupEntityIndexes();
+    }
+
+    /**
+     * Index definitions per entity store collection.
+     * Each index enables efficient queries without full-collection scans.
+     */
+    static get ENTITY_INDEXES() {
+        return {
+            accounts_store: [
+                { field: 'id',          name: 'idx_account_id'         },
+                { field: 'reputation',  name: 'idx_account_reputation' },
+                { field: 'created',     name: 'idx_account_created'    },
+                { field: 'last_post',   name: 'idx_account_last_post'  },
+                { field: 'post_count',  name: 'idx_account_post_count' },
+                { field: '_stored_at',  name: 'idx_account_stored_at'  },
+            ],
+            posts_store: [
+                { field: 'author',               name: 'idx_post_author'         },
+                { field: 'category',             name: 'idx_post_category'       },
+                { field: 'created',              name: 'idx_post_created'        },
+                { field: 'pending_payout_value', name: 'idx_post_pending_payout' },
+                { field: 'net_votes',            name: 'idx_post_net_votes'      },
+                { field: 'cashout_time',         name: 'idx_post_cashout'        },
+                { field: 'depth',                name: 'idx_post_depth'          },
+                { field: '_stored_at',           name: 'idx_post_stored_at'      },
+            ],
+            comments_store: [
+                { field: 'author',          name: 'idx_comment_author'          },
+                { field: 'parent_author',   name: 'idx_comment_parent_author'   },
+                { field: 'parent_permlink', name: 'idx_comment_parent_permlink' },
+                { field: 'created',         name: 'idx_comment_created'         },
+                { field: 'net_votes',       name: 'idx_comment_net_votes'       },
+                { field: 'root_author',     name: 'idx_comment_root_author'     },
+                { field: 'depth',           name: 'idx_comment_depth'           },
+                { field: '_stored_at',      name: 'idx_comment_stored_at'       },
+            ],
+            query_cache: [
+                { field: 'entity_type', name: 'idx_qc_entity_type' },
+                { field: 'timestamp',   name: 'idx_qc_timestamp'   },
+            ],
+        };
+    }
+
+    /** @private */
+    async _setupEntityIndexes() {
+        const indexDefs = PixaProxyAPI.ENTITY_INDEXES;
+        for (const [collectionName, indexes] of Object.entries(indexDefs)) {
+            try {
+                const col = await this.cacheDb.getCollection(collectionName);
+                for (const idx of indexes) {
+                    try {
+                        await col.createIndex(idx.field, { name: idx.name, unique: false });
+                    } catch (e) {
+                        // Index already exists or createIndex not supported — skip
+                    }
+                }
+            } catch (e) {
+                console.warn(`[PixaProxyAPI] Index setup for ${collectionName} skipped:`, e.message);
+            }
+        }
     }
 
     async _setupCollectionGroup(db, collectionNames, groupName) {
@@ -1307,31 +1431,45 @@ export class PixaProxyAPI {
             return this.sanitizationPipeline.sanitizeAccount(account);
         }
 
-        // Legacy fallback
-        const formatted = {
-            ...account,
+        // Legacy fallback — build field-by-field, NO spread of raw data.
+        // Dangerous fields keep their names but store PARSED safe objects.
+        let parsedPostingMeta = { profile: {}, tags: [], extra: {} };
+        let parsedJsonMeta    = { profile: {}, tags: [], extra: {} };
+        try { parsedPostingMeta = this.contentSanitizer.parseMetadata(account.posting_json_metadata || '{}'); } catch (e) {}
+        try { parsedJsonMeta    = this.contentSanitizer.parseMetadata(account.json_metadata || '{}'); } catch (e) {}
+        const profile = { ...(parsedJsonMeta.profile || {}), ...(parsedPostingMeta.profile || {}) };
+
+        return {
+            _entity_type: 'account',
+            _sanitized: true,
+            _stored_at: Date.now(),
+            _profile: {
+                display_name: profile.name || null,
+                about: profile.about
+                    ? this.contentSanitizer.sanitizeBiography(profile.about, 512)
+                    : null,
+                location: profile.location
+                    ? this.contentSanitizer.sanitizeBiography(profile.location, 128)
+                    : null,
+                website: profile.website
+                    ? this.contentSanitizer.sanitizeBiography(profile.website, 256)
+                    : null,
+                profile_image: profile.profile_image || null,
+                cover_image: profile.cover_image || null,
+            },
+            _links: [],
+            name: account.name || '',
+            id: account.id || 0,
+            json_metadata:         parsedJsonMeta,
+            posting_json_metadata: parsedPostingMeta,
+            reputation:       typeof account.reputation === 'number' ? account.reputation : 0,
             reputation_score: this.formatter.reputation(account.reputation),
-            formatted_balance: account.balance,
-            formatted_vesting: account.vesting_shares,
+            balance: account.balance || '0.000 PIXA',
+            vesting_shares: account.vesting_shares || '0.000000 VESTS',
+            voting_power: account.voting_power || 0,
+            post_count: account.post_count || 0,
+            created: VALIDATORS.safe_timestamp(account.created),
         };
-
-        // Parse json_metadata through pixa-content if available
-        if (account.json_metadata || account.posting_json_metadata) {
-            try {
-                const raw = account.posting_json_metadata || account.json_metadata;
-                const meta = this.contentSanitizer.parseMetadata(raw);
-                formatted.parsed_metadata = meta;
-
-                // Sanitize profile bio if present
-                if (meta.profile?.about) {
-                    formatted.sanitized_about = this.contentSanitizer.sanitizeBiography(meta.profile.about, 512);
-                }
-            } catch (e) {
-                // Non-critical — keep going with raw metadata
-            }
-        }
-
-        return formatted;
     }
 
     /**
@@ -1352,16 +1490,40 @@ export class PixaProxyAPI {
             return this.sanitizationPipeline.sanitizePost(post, renderOptions);
         }
 
-        // Legacy fallback
+        // Legacy fallback — build field-by-field, NO spread of raw data.
         const processed = this.contentSanitizer.renderPost(post.body || '', renderOptions);
+        let meta = { profile: {}, tags: [], extra: {} };
+        try { meta = this.contentSanitizer.parseMetadata(post.json_metadata || '{}'); } catch (e) {}
         return {
-            ...post,
-            html: processed.html,
-            sanitizedBody: processed.html,
-            images: processed.images,
-            links: processed.links,
-            wordCount: processed.wordCount,
+            _entity_type: 'post',
+            _sanitized: true,
+            _stored_at: Date.now(),
+            _images: processed.images || [],
+            _links: processed.links || [],
+            _summary: this.contentSanitizer.extractPlainText(post.body || '').slice(0, 500),
+            _word_count: processed.wordCount || 0,
+            id: post.id || 0,
+            author: post.author || '',
+            permlink: post.permlink || '',
+            title: post.title || '',
+            body: processed.html || '',
+            json_metadata: meta,
+            category: post.category || '',
+            parent_author: post.parent_author || '',
+            parent_permlink: post.parent_permlink || '',
+            created: VALIDATORS.safe_timestamp(post.created),
+            last_update: VALIDATORS.safe_timestamp(post.last_update),
+            active: VALIDATORS.safe_timestamp(post.active),
+            cashout_time: VALIDATORS.safe_timestamp(post.cashout_time),
+            last_payout: VALIDATORS.safe_timestamp(post.last_payout),
+            depth: post.depth ?? 0,
+            children: post.children ?? 0,
+            net_votes: post.net_votes ?? 0,
             author_reputation: this.formatter.reputation(post.author_reputation),
+            pending_payout_value: post.pending_payout_value || '0.000 PXS',
+            total_payout_value: post.total_payout_value || '0.000 PXS',
+            curator_payout_value: post.curator_payout_value || '0.000 PXS',
+            url: post.url || '',
         };
     }
 
@@ -1383,16 +1545,40 @@ export class PixaProxyAPI {
             return this.sanitizationPipeline.sanitizeComment(comment, renderOptions);
         }
 
-        // Legacy fallback
+        // Legacy fallback — build field-by-field, NO spread of raw data.
         const processed = this.contentSanitizer.renderComment(comment.body || '', renderOptions);
+        let meta = { profile: {}, tags: [], extra: {} };
+        try { meta = this.contentSanitizer.parseMetadata(comment.json_metadata || '{}'); } catch (e) {}
         return {
-            ...comment,
-            html: processed.html,
-            sanitizedBody: processed.html,
-            images: processed.images,
-            links: processed.links,
-            wordCount: processed.wordCount,
+            _entity_type: 'comment',
+            _sanitized: true,
+            _stored_at: Date.now(),
+            _images: processed.images || [],
+            _links: processed.links || [],
+            _word_count: processed.wordCount || 0,
+            id: comment.id || 0,
+            author: comment.author || '',
+            permlink: comment.permlink || '',
+            title: '',
+            body: processed.html || '',
+            json_metadata: meta,
+            parent_author: comment.parent_author || '',
+            parent_permlink: comment.parent_permlink || '',
+            created: VALIDATORS.safe_timestamp(comment.created),
+            last_update: VALIDATORS.safe_timestamp(comment.last_update),
+            active: VALIDATORS.safe_timestamp(comment.active),
+            cashout_time: VALIDATORS.safe_timestamp(comment.cashout_time),
+            last_payout: VALIDATORS.safe_timestamp(comment.last_payout),
+            depth: comment.depth ?? 1,
+            children: comment.children ?? 0,
+            net_votes: comment.net_votes ?? 0,
             author_reputation: this.formatter.reputation(comment.author_reputation),
+            pending_payout_value: comment.pending_payout_value || '0.000 PXS',
+            total_payout_value: comment.total_payout_value || '0.000 PXS',
+            curator_payout_value: comment.curator_payout_value || '0.000 PXS',
+            root_author: comment.root_author || '',
+            root_permlink: comment.root_permlink || '',
+            url: comment.url || '',
         };
     }
 
@@ -3919,11 +4105,16 @@ class SanitizationPipeline {
         this.formatter = formatter;
     }
 
+    // ── ACCOUNT ─────────────────────────────────────────────────────────
+
     /**
      * Sanitize a raw account object for storage.
-     * Parses json_metadata, extracts & sanitizes profile fields (name, about/bio, username).
+     * DANGEROUS FIELDS (`json_metadata`, `posting_json_metadata`) keep their
+     * original names but store the WASM-parsed safe object — never the raw string.
+     * All dates are integer millisecond timestamps (`new Date(ts)` ready).
+     *
      * @param {object} raw - Raw account from blockchain RPC
-     * @returns {object} Sanitized account ready for DB insertion
+     * @returns {object|null} Sanitized account ready for DB insertion
      */
     sanitizeAccount(raw) {
         if (!raw || !raw.name) return null;
@@ -3931,238 +4122,331 @@ class SanitizationPipeline {
         const name = this.sanitizer.sanitizeUsername(raw.name);
         if (!name) return null;
 
-        // Parse metadata through WASM (handles PIXA/HIVE/STEEM variants)
-        const rawMeta = raw.posting_json_metadata || raw.json_metadata || '{}';
-        let meta = { profile: {}, tags: [], extra: {} };
-        try { meta = this.sanitizer.parseMetadata(rawMeta); } catch (e) {}
-        const profile = meta.profile || {};
+        // DANGEROUS: parse raw JSON strings through WASM, store parsed result only
+        const rawPostingMeta = raw.posting_json_metadata || '{}';
+        const rawJsonMeta    = raw.json_metadata || '{}';
+        let postingMeta = { profile: {}, tags: [], extra: {} };
+        let jsonMeta    = { profile: {}, tags: [], extra: {} };
+        try { postingMeta = this.sanitizer.parseMetadata(rawPostingMeta); } catch (e) {}
+        try { jsonMeta    = this.sanitizer.parseMetadata(rawJsonMeta); } catch (e) {}
 
-        // Build entity FIELD BY FIELD — no { ...raw } spread
+        // Merge profile: posting_json_metadata takes priority
+        const profile = { ...(jsonMeta.profile || {}), ...(postingMeta.profile || {}) };
+
+        // Sanitize profile fields
+        const displayName  = profile.name     ? this.sanitizer.sanitizeBiography(profile.name, 64)     : null;
+        const about        = profile.about    ? this.sanitizer.sanitizeBiography(profile.about, 512)   : null;
+        const location     = profile.location ? this.sanitizer.sanitizeBiography(profile.location, 128): null;
+        const website      = profile.website  ? this.sanitizer.sanitizeBiography(profile.website, 256) : null;
+        const profileImage = typeof profile.profile_image === 'string' ? profile.profile_image : null;
+        const coverImage   = typeof profile.cover_image   === 'string' ? profile.cover_image   : null;
+
+        const links = [];
+        if (website)      links.push(website);
+        if (profileImage) links.push(profileImage);
+        if (coverImage)   links.push(coverImage);
+
+        // Build entity FIELD BY FIELD — no { ...raw } spread.
         return {
-            _entity_id: name,
+            _entity_id:   name,
             _entity_type: 'account',
-            _sanitized: true,
-            _stored_at: Date.now(),
+            _sanitized:   true,
+            _stored_at:   Date.now(),
+
+            // Enrichment
+            _profile: { display_name: displayName, about, location, website, profile_image: profileImage, cover_image: coverImage },
+            _links: links,
 
             // Identity
             name,
             id: VALIDATORS.safe_number(raw.id) ?? 0,
 
-            // Keep metadata as original strings (downstream does JSON.parse)
-            json_metadata:          raw.json_metadata || '{}',
-            posting_json_metadata:  raw.posting_json_metadata || '{}',
-            parsed_metadata:        meta,
+            // DANGEROUS fields — keep names, store PARSED safe objects
+            json_metadata:         jsonMeta,
+            posting_json_metadata: postingMeta,
+
+            // Authority objects (structured chain data, not user text)
+            owner:   VALIDATORS.safe_authority(raw.owner),
+            active:  VALIDATORS.safe_authority(raw.active),
+            posting: VALIDATORS.safe_authority(raw.posting),
 
             // Reputation
-            reputation:      VALIDATORS.safe_number(raw.reputation) ?? 0,
+            reputation:       VALIDATORS.safe_number(raw.reputation) ?? 0,
             reputation_score: this.formatter ? this.formatter.reputation(raw.reputation) : 25,
 
-            // Balances (validated asset format)
-            balance:                    VALIDATORS.safe_asset(raw.balance) || '0.000 PIXA',
-            savings_balance:            VALIDATORS.safe_asset(raw.savings_balance) || '0.000 PIXA',
-            pxs_balance:                VALIDATORS.safe_asset(raw.pxs_balance) || '0.000 PXS',
-            savings_pxs_balance:        VALIDATORS.safe_asset(raw.savings_pxs_balance) || '0.000 PXS',
-            vesting_shares:             VALIDATORS.safe_asset(raw.vesting_shares) || '0.000000 VESTS',
-            delegated_vesting_shares:   VALIDATORS.safe_asset(raw.delegated_vesting_shares) || '0.000000 VESTS',
-            received_vesting_shares:    VALIDATORS.safe_asset(raw.received_vesting_shares) || '0.000000 VESTS',
-            vesting_withdraw_rate:      VALIDATORS.safe_asset(raw.vesting_withdraw_rate) || '0.000000 VESTS',
-            reward_pixa_balance:        VALIDATORS.safe_asset(raw.reward_pixa_balance) || '0.000 PIXA',
-            reward_pxs_balance:         VALIDATORS.safe_asset(raw.reward_pxs_balance) || '0.000 PXS',
-            reward_vesting_balance:     VALIDATORS.safe_asset(raw.reward_vesting_balance) || '0.000000 VESTS',
-            reward_vesting_pixa:        VALIDATORS.safe_asset(raw.reward_vesting_pixa) || '0.000 PIXA',
+            // Balances
+            balance:                  VALIDATORS.safe_asset(raw.balance) || '0.000 PIXA',
+            savings_balance:          VALIDATORS.safe_asset(raw.savings_balance) || '0.000 PIXA',
+            pxs_balance:              VALIDATORS.safe_asset(raw.pxs_balance) || '0.000 PXS',
+            savings_pxs_balance:      VALIDATORS.safe_asset(raw.savings_pxs_balance) || '0.000 PXS',
+            vesting_shares:           VALIDATORS.safe_asset(raw.vesting_shares) || '0.000000 VESTS',
+            delegated_vesting_shares: VALIDATORS.safe_asset(raw.delegated_vesting_shares) || '0.000000 VESTS',
+            received_vesting_shares:  VALIDATORS.safe_asset(raw.received_vesting_shares) || '0.000000 VESTS',
+            vesting_withdraw_rate:    VALIDATORS.safe_asset(raw.vesting_withdraw_rate) || '0.000000 VESTS',
+            reward_pixa_balance:      VALIDATORS.safe_asset(raw.reward_pixa_balance) || '0.000 PIXA',
+            reward_pxs_balance:       VALIDATORS.safe_asset(raw.reward_pxs_balance) || '0.000 PXS',
+            reward_vesting_balance:   VALIDATORS.safe_asset(raw.reward_vesting_balance) || '0.000000 VESTS',
+            reward_vesting_pixa:      VALIDATORS.safe_asset(raw.reward_vesting_pixa) || '0.000 PIXA',
+            post_voting_power:        VALIDATORS.safe_asset(raw.post_voting_power) || '0.000000 VESTS',
 
-            // Voting / activity
-            voting_power:       VALIDATORS.safe_number(raw.voting_power) ?? 0,
-            voting_manabar:     VALIDATORS.safe_manabar(raw.voting_manabar),
-            post_count:         VALIDATORS.safe_number(raw.post_count) ?? 0,
-            created:            VALIDATORS.safe_iso_date(raw.created) || '',
-            last_post:          VALIDATORS.safe_iso_date(raw.last_post) || '',
-            last_vote_time:     VALIDATORS.safe_iso_date(raw.last_vote_time) || '',
+            // Voting / mana
+            voting_power:    VALIDATORS.safe_number(raw.voting_power) ?? 0,
+            voting_manabar:  VALIDATORS.safe_manabar(raw.voting_manabar),
+            downvote_manabar: VALIDATORS.safe_manabar(raw.downvote_manabar),
+            can_vote:        VALIDATORS.safe_bool(raw.can_vote) ?? true,
+
+            // Activity counts
+            post_count:          VALIDATORS.safe_number(raw.post_count) ?? 0,
+            curation_rewards:    VALIDATORS.safe_number(raw.curation_rewards) ?? 0,
+            posting_rewards:     VALIDATORS.safe_number(raw.posting_rewards) ?? 0,
             witnesses_voted_for: VALIDATORS.safe_number(raw.witnesses_voted_for) ?? 0,
 
-            // Keys / proxy
-            memo_key:           VALIDATORS.safe_pubkey(raw.memo_key) || '',
-            proxy:              raw.proxy ? (this.sanitizer.sanitizeUsername(raw.proxy) || '') : '',
+            // Timestamps (integer ms — `new Date(ts)`)
+            created:             VALIDATORS.safe_timestamp(raw.created),
+            last_post:           VALIDATORS.safe_timestamp(raw.last_post),
+            last_root_post:      VALIDATORS.safe_timestamp(raw.last_root_post),
+            last_vote_time:      VALIDATORS.safe_timestamp(raw.last_vote_time),
+            last_account_update: VALIDATORS.safe_timestamp(raw.last_account_update),
+            last_owner_update:   VALIDATORS.safe_timestamp(raw.last_owner_update),
 
-            // Profile fields (from sanitized metadata)
-            sanitized_name:     name,
-            display_name:       profile.name ? this.sanitizer.sanitizeBiography(profile.name, 64) : null,
-            sanitized_about:    profile.about ? this.sanitizer.sanitizeBiography(profile.about, 512) : null,
-            profile_image:      typeof profile.profile_image === 'string' ? profile.profile_image : null,
-            cover_image:        typeof profile.cover_image === 'string' ? profile.cover_image : null,
-            sanitized_location: profile.location ? this.sanitizer.sanitizeBiography(profile.location, 128) : null,
-            sanitized_website:  profile.website ? this.sanitizer.sanitizeBiography(profile.website, 256) : null,
+            // Power down
+            next_vesting_withdrawal: VALIDATORS.safe_timestamp(raw.next_vesting_withdrawal),
+            withdrawn:               VALIDATORS.safe_number(raw.withdrawn) ?? 0,
+            to_withdraw:             VALIDATORS.safe_number(raw.to_withdraw) ?? 0,
+            withdraw_routes:         VALIDATORS.safe_number(raw.withdraw_routes) ?? 0,
+
+            // Savings
+            savings_withdraw_requests: VALIDATORS.safe_number(raw.savings_withdraw_requests) ?? 0,
+
+            // Governance
+            witness_votes: Array.isArray(raw.witness_votes)
+                ? raw.witness_votes.filter(w => typeof w === 'string' && w.length <= 16)
+                : [],
+            proxied_vsf_votes: Array.isArray(raw.proxied_vsf_votes)
+                ? raw.proxied_vsf_votes.map(v => String(v))
+                : [],
+
+            // Keys / proxy / recovery
+            memo_key:         VALIDATORS.safe_pubkey(raw.memo_key) || '',
+            proxy:            raw.proxy ? (this.sanitizer.sanitizeUsername(raw.proxy) || '') : '',
+            recovery_account: raw.recovery_account ? (this.sanitizer.sanitizeUsername(raw.recovery_account) || '') : '',
         };
     }
 
+    // ── POST ────────────────────────────────────────────────────────────
+
     /**
      * Sanitize a raw post (root-level content, depth=0) for storage.
-     * Runs body through WASM renderPost, parses json_metadata for tags/images.
+     * `body` stores sanitized HTML (raw markdown is discarded).
+     * `json_metadata` keeps its name but stores the WASM-parsed safe object.
+     * All dates are integer millisecond timestamps.
+     *
      * @param {object} raw - Raw discussion/post from blockchain RPC
-     * @param {object} [renderOptions] - Override render options
-     * @returns {object} Sanitized post ready for DB insertion
+     * @param {object} [renderOptions]
+     * @returns {object|null} Sanitized post ready for DB insertion
      */
     sanitizePost(raw, renderOptions = {}) {
         if (!raw || !raw.author || !raw.permlink) return null;
 
-        const author = this.sanitizer.sanitizeUsername(raw.author);
+        const author   = this.sanitizer.sanitizeUsername(raw.author);
         const permlink = VALIDATORS.safe_permlink(raw.permlink);
         if (!author || !permlink) return null;
 
         const entityId = `${author}_${permlink}`;
 
-        // Render body through WASM sanitizer
+        // DANGEROUS: body — sanitize through WASM, store only sanitized HTML
         const rendered = this.sanitizer.renderPost(raw.body || '', renderOptions);
 
-        // Parse metadata through WASM
+        // DANGEROUS: json_metadata — parse through WASM, store parsed object
         let meta = { profile: {}, tags: [], extra: {} };
         try { meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}'); } catch (e) {}
 
-        // Build entity FIELD BY FIELD — no { ...raw } spread
+        // Build entity FIELD BY FIELD — no { ...raw } spread.
         return {
-            _entity_id: entityId,
+            _entity_id:   entityId,
             _entity_type: 'post',
-            _sanitized: true,
-            _stored_at: Date.now(),
+            _sanitized:   true,
+            _stored_at:   Date.now(),
+
+            // Enrichment
+            _images:     rendered.images || [],
+            _links:      rendered.links || [],
+            _summary:    this.sanitizer.extractPlainText(raw.body || '').slice(0, 500),
+            _tags:       meta.tags || [],
+            _word_count: rendered.wordCount || 0,
+            _app:        typeof meta.app === 'string' ? meta.app : '',
 
             // Identity
+            id:              VALIDATORS.safe_number(raw.id) ?? 0,
             author,
             permlink,
             category:        this.sanitizer.sanitizeBiography(raw.category || '', 64),
             parent_author:   '',
             parent_permlink: this.sanitizer.sanitizeBiography(raw.parent_permlink || '', 256),
 
-            // Content (sanitized)
-            title:           this.sanitizer.sanitizeBiography(raw.title || '', 256),
-            body:            raw.body || '',
-            html:            rendered.html,
-            sanitizedBody:   rendered.html,
-            images:          rendered.images,
-            links:           rendered.links,
-            wordCount:       rendered.wordCount,
-            plainText:       this.sanitizer.extractPlainText(raw.body || '').slice(0, 500),
+            // Content — body IS sanitized HTML
+            title: this.sanitizer.sanitizeBiography(raw.title || '', 256),
+            body:  rendered.html || '',
 
-            // Metadata (json_metadata stays as original string)
-            json_metadata:   raw.json_metadata || '{}',
-            parsed_metadata: meta,
-            tags:            meta.tags || [],
-            app:             typeof meta.app === 'string' ? meta.app : '',
+            // DANGEROUS field — keeps name, stores PARSED safe object
+            json_metadata: meta,
 
-            // Timestamps
-            created:         VALIDATORS.safe_iso_date(raw.created) || '',
-            last_update:     VALIDATORS.safe_iso_date(raw.last_update) || '',
+            // Timestamps (integer ms)
+            created:     VALIDATORS.safe_timestamp(raw.created),
+            last_update: VALIDATORS.safe_timestamp(raw.last_update),
+            active:      VALIDATORS.safe_timestamp(raw.active),
+            cashout_time: VALIDATORS.safe_timestamp(raw.cashout_time),
+            last_payout: VALIDATORS.safe_timestamp(raw.last_payout),
 
-            // Numbers
-            depth:           VALIDATORS.safe_number(raw.depth) ?? 0,
-            children:        VALIDATORS.safe_number(raw.children) ?? 0,
-            net_votes:       VALIDATORS.safe_number(raw.net_votes) ?? 0,
+            // Hierarchy
+            depth:    VALIDATORS.safe_number(raw.depth) ?? 0,
+            children: VALIDATORS.safe_number(raw.children) ?? 0,
+
+            // Voting
+            net_votes:  VALIDATORS.safe_number(raw.net_votes) ?? 0,
+            net_rshares: VALIDATORS.safe_numeric_string(raw.net_rshares) || '0',
             author_reputation: this.formatter ? this.formatter.reputation(raw.author_reputation) : 25,
 
-            // Economics
-            net_rshares:            VALIDATORS.safe_numeric_string(raw.net_rshares) || '0',
-            total_payout_value:     VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
-            curator_payout_value:   VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
-            pending_payout_value:   VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
-            max_accepted_payout:    VALIDATORS.safe_asset(raw.max_accepted_payout) || '1000000.000 PXS',
-            percent_pxs:            VALIDATORS.safe_percent(raw.percent_pxs) ?? 10000,
+            // Active votes — array of validated objects
+            active_votes: Array.isArray(raw.active_votes)
+                ? raw.active_votes
+                    .map(v => VALIDATORS.safe_active_vote(v, this.sanitizer.sanitizeUsername.bind(this.sanitizer)))
+                    .filter(Boolean)
+                : [],
+
+            // Payouts
+            total_payout_value:         VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
+            curator_payout_value:       VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
+            pending_payout_value:       VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
+            total_pending_payout_value: VALIDATORS.safe_asset(raw.total_pending_payout_value) || '0.000 PXS',
+            max_accepted_payout:        VALIDATORS.safe_asset(raw.max_accepted_payout) || '1000000.000 PXS',
+            promoted:                   VALIDATORS.safe_asset(raw.promoted) || '0.000 PXS',
+            percent_pxs:                VALIDATORS.safe_percent(raw.percent_pxs) ?? 10000,
+            author_rewards:             VALIDATORS.safe_number(raw.author_rewards) ?? 0,
 
             // Flags
-            allow_votes:             VALIDATORS.safe_bool(raw.allow_votes) ?? true,
-            allow_curation_rewards:  VALIDATORS.safe_bool(raw.allow_curation_rewards) ?? true,
+            allow_replies:          VALIDATORS.safe_bool(raw.allow_replies) ?? true,
+            allow_votes:            VALIDATORS.safe_bool(raw.allow_votes) ?? true,
+            allow_curation_rewards: VALIDATORS.safe_bool(raw.allow_curation_rewards) ?? true,
 
             // Beneficiaries
             beneficiaries: Array.isArray(raw.beneficiaries)
                 ? raw.beneficiaries.map(VALIDATORS.safe_beneficiary).filter(Boolean)
                 : [],
 
-            // Derived
-            root_title:     this.sanitizer.sanitizeBiography(raw.root_title || '', 256),
-            url:            VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
+            // Navigation / root
+            url:           VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
+            root_title:    this.sanitizer.sanitizeBiography(raw.root_title || '', 256),
+            root_author:   raw.root_author ? (this.sanitizer.sanitizeUsername(raw.root_author) || '') : '',
+            root_permlink: VALIDATORS.safe_permlink(raw.root_permlink) || '',
         };
     }
+
+    // ── COMMENT ─────────────────────────────────────────────────────────
 
     /**
      * Sanitize a comment/reply (depth > 0) for storage.
      * Uses renderComment (stricter subset — no headings, tables, iframes).
+     * Same field contract as sanitizePost (all dates = integer timestamps, etc.)
+     *
      * @param {object} raw - Raw comment from blockchain RPC
-     * @param {object} [renderOptions] - Override render options
-     * @returns {object} Sanitized comment ready for DB insertion
+     * @param {object} [renderOptions]
+     * @returns {object|null} Sanitized comment ready for DB insertion
      */
     sanitizeComment(raw, renderOptions = {}) {
         if (!raw || !raw.author || !raw.permlink) return null;
 
-        const author = this.sanitizer.sanitizeUsername(raw.author);
+        const author   = this.sanitizer.sanitizeUsername(raw.author);
         const permlink = VALIDATORS.safe_permlink(raw.permlink);
         if (!author || !permlink) return null;
 
         const entityId = `${author}_${permlink}`;
 
-        // Render body through comment sanitizer (stricter)
+        // DANGEROUS: body
         const rendered = this.sanitizer.renderComment(raw.body || '', renderOptions);
 
-        // Parse comment metadata
+        // DANGEROUS: json_metadata
         let meta = { profile: {}, tags: [], extra: {} };
         try { meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}'); } catch (e) {}
 
-        // Build entity FIELD BY FIELD — no { ...raw } spread
         return {
-            _entity_id: entityId,
+            _entity_id:   entityId,
             _entity_type: 'comment',
-            _sanitized: true,
-            _stored_at: Date.now(),
+            _sanitized:   true,
+            _stored_at:   Date.now(),
+
+            // Enrichment
+            _images:     rendered.images || [],
+            _links:      rendered.links || [],
+            _word_count: rendered.wordCount || 0,
 
             // Identity
+            id:              VALIDATORS.safe_number(raw.id) ?? 0,
             author,
             permlink,
             parent_author:   raw.parent_author ? (this.sanitizer.sanitizeUsername(raw.parent_author) || '') : '',
             parent_permlink: VALIDATORS.safe_permlink(raw.parent_permlink) || '',
 
-            // Content
-            title:           '',
-            body:            raw.body || '',
-            html:            rendered.html,
-            sanitizedBody:   rendered.html,
-            images:          rendered.images,
-            links:           rendered.links,
-            wordCount:       rendered.wordCount,
+            // Content — body IS sanitized HTML
+            title: '',
+            body:  rendered.html || '',
 
-            // Metadata (json_metadata stays as original string)
-            json_metadata:   raw.json_metadata || '{}',
-            parsed_metadata: meta,
+            // DANGEROUS field — keeps name, stores PARSED safe object
+            json_metadata: meta,
 
-            // Timestamps
-            created:         VALIDATORS.safe_iso_date(raw.created) || '',
-            last_update:     VALIDATORS.safe_iso_date(raw.last_update) || '',
+            // Timestamps (integer ms)
+            created:      VALIDATORS.safe_timestamp(raw.created),
+            last_update:  VALIDATORS.safe_timestamp(raw.last_update),
+            active:       VALIDATORS.safe_timestamp(raw.active),
+            cashout_time: VALIDATORS.safe_timestamp(raw.cashout_time),
+            last_payout:  VALIDATORS.safe_timestamp(raw.last_payout),
 
-            // Numbers
-            depth:           VALIDATORS.safe_number(raw.depth) ?? 1,
-            children:        VALIDATORS.safe_number(raw.children) ?? 0,
-            net_votes:       VALIDATORS.safe_number(raw.net_votes) ?? 0,
+            // Hierarchy
+            depth:    VALIDATORS.safe_number(raw.depth) ?? 1,
+            children: VALIDATORS.safe_number(raw.children) ?? 0,
+
+            // Voting
+            net_votes:  VALIDATORS.safe_number(raw.net_votes) ?? 0,
+            net_rshares: VALIDATORS.safe_numeric_string(raw.net_rshares) || '0',
             author_reputation: this.formatter ? this.formatter.reputation(raw.author_reputation) : 25,
 
-            // Economics
-            net_rshares:            VALIDATORS.safe_numeric_string(raw.net_rshares) || '0',
-            pending_payout_value:   VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
-            total_payout_value:     VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
-            curator_payout_value:   VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
+            active_votes: Array.isArray(raw.active_votes)
+                ? raw.active_votes
+                    .map(v => VALIDATORS.safe_active_vote(v, this.sanitizer.sanitizeUsername.bind(this.sanitizer)))
+                    .filter(Boolean)
+                : [],
 
-            // Derived
-            root_title:     '',
-            url:            VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
+            // Payouts
+            pending_payout_value:       VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
+            total_payout_value:         VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
+            curator_payout_value:       VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
+            total_pending_payout_value: VALIDATORS.safe_asset(raw.total_pending_payout_value) || '0.000 PXS',
+            promoted:                   VALIDATORS.safe_asset(raw.promoted) || '0.000 PXS',
+            author_rewards:             VALIDATORS.safe_number(raw.author_rewards) ?? 0,
+
+            // Flags
+            allow_replies:          VALIDATORS.safe_bool(raw.allow_replies) ?? true,
+            allow_votes:            VALIDATORS.safe_bool(raw.allow_votes) ?? true,
+            allow_curation_rewards: VALIDATORS.safe_bool(raw.allow_curation_rewards) ?? true,
+
+            // Navigation / root
+            url:           VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
+            root_title:    this.sanitizer.sanitizeBiography(raw.root_title || '', 256),
+            root_author:   raw.root_author ? (this.sanitizer.sanitizeUsername(raw.root_author) || '') : '',
+            root_permlink: VALIDATORS.safe_permlink(raw.root_permlink) || '',
         };
     }
 
+    // ── AUTO-DETECT ─────────────────────────────────────────────────────
+
     /**
      * Auto-detect entity type and sanitize accordingly.
-     * Posts have depth=0 and empty parent_author; everything else is a comment/reply.
      * @param {object} raw - Raw content from blockchain
      * @param {object} [renderOptions]
-     * @returns {object|null} Sanitized entity
+     * @returns {object|null}
      */
     sanitizeContent(raw, renderOptions = {}) {
         if (!raw) return null;
-
-        // Detect: root post vs comment/reply
         const isPost = (!raw.parent_author || raw.parent_author === '') && (raw.depth === 0 || raw.depth === undefined);
         return isPost
             ? this.sanitizePost(raw, renderOptions)
@@ -4481,11 +4765,6 @@ class ContentSanitizer {
     renderPost(body, options = {}) {
         if (!body) return { html: '', images: [], links: [], wordCount: 0 };
 
-        if (!this.ready) {
-            console.warn('[ContentSanitizer] WASM engine not ready, returning unsanitized fallback');
-            return this._fallbackProcess(body);
-        }
-
         try {
             const opts = { ...this.defaultOptions, ...options };
             // v0.2: sanitizePost(body, optsJson) → PostResult { html, images, links }
@@ -4499,7 +4778,7 @@ class ContentSanitizer {
             };
         } catch (e) {
             console.error('[ContentSanitizer] renderPost error:', e);
-            return this._fallbackProcess(body);
+            return { html: '', images: [], links: [], wordCount: 0 };
         }
     }
 
@@ -4512,11 +4791,6 @@ class ContentSanitizer {
      */
     renderComment(body, options = {}) {
         if (!body) return { html: '', images: [], links: [], wordCount: 0 };
-
-        if (!this.ready) {
-            console.warn('[ContentSanitizer] WASM engine not ready, returning unsanitized fallback');
-            return this._fallbackProcess(body);
-        }
 
         try {
             const opts = { ...this.defaultOptions, ...options };
@@ -4531,7 +4805,7 @@ class ContentSanitizer {
             };
         } catch (e) {
             console.error('[ContentSanitizer] renderComment error:', e);
-            return this._fallbackProcess(body);
+            return { html: '', images: [], links: [], wordCount: 0 };
         }
     }
 
@@ -4545,16 +4819,12 @@ class ContentSanitizer {
     renderMemo(body, options = {}) {
         if (!body) return { html: '' };
 
-        if (!this.ready) {
-            return { html: body.replace(/<[^>]*>/g, '') };
-        }
-
         try {
             const opts = { ...this.defaultOptions, ...options };
             return wasmSanitizeMemo(body, JSON.stringify(opts));
         } catch (e) {
             console.error('[ContentSanitizer] renderMemo error:', e);
-            return { html: body.replace(/<[^>]*>/g, '') };
+            return { html: '' };
         }
     }
 
@@ -4567,12 +4837,8 @@ class ContentSanitizer {
     safeJson(jsonStr) {
         if (!jsonStr) return {};
 
-        if (!this.ready) {
-            try { return JSON.parse(jsonStr); } catch { return {}; }
-        }
-
         try {
-            return wasmSafeJson(jsonStr);
+            return JSON.parse(wasmSafeJson(jsonStr));
         } catch (e) {
             console.error('[ContentSanitizer] safeJson error:', e);
             return {};
@@ -4588,10 +4854,6 @@ class ContentSanitizer {
      */
     safeString(s, maxLen = 10000) {
         if (!s || typeof s !== 'string') return '';
-
-        if (!this.ready) {
-            return s.replace(/<[^>]*>/g, '').slice(0, maxLen);
-        }
 
         try {
             return wasmSafeString(s, maxLen) || '';
@@ -4609,15 +4871,11 @@ class ContentSanitizer {
     extractPlainText(body) {
         if (!body) return '';
 
-        if (!this.ready) {
-            return body.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
-        }
-
         try {
             return wasmExtractPlainText(body);
         } catch (e) {
             console.error('[ContentSanitizer] extractPlainText error:', e);
-            return body.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+            return '';
         }
     }
 
@@ -4630,16 +4888,11 @@ class ContentSanitizer {
     summarize(body, sentenceCount = 3) {
         if (!body) return { summary: '', keywords: [], sentences: [] };
 
-        if (!this.ready) {
-            console.warn('[ContentSanitizer] WASM engine not ready for summarization');
-            return { summary: body.slice(0, 280), keywords: [], sentences: [] };
-        }
-
         try {
             return wasmSummarizeContent(body, sentenceCount);
         } catch (e) {
             console.error('[ContentSanitizer] summarize error:', e);
-            return { summary: body.slice(0, 280), keywords: [], sentences: [] };
+            return { summary: '', keywords: [], sentences: [] };
         }
     }
 
@@ -4651,44 +4904,11 @@ class ContentSanitizer {
     parseMetadata(jsonString) {
         if (!jsonString) return { profile: {}, tags: [], extra: {} };
 
-        if (!this.ready) {
-            try {
-                return JSON.parse(jsonString);
-            } catch {
-                return { profile: {}, tags: [], extra: {} };
-            }
-        }
-
         try {
-            return wasmParseMetadata(jsonString);
+            return JSON.parse(wasmParseMetadata(jsonString));
         } catch (e) {
             console.error('[ContentSanitizer] parseMetadata error:', e);
             return { profile: {}, tags: [], extra: {} };
-        }
-    }
-
-    /**
-     * Parse profile-specific metadata
-     * @param {string} jsonString
-     * @returns {object} Profile object
-     */
-    parseProfile(jsonString) {
-        if (!jsonString) return {};
-
-        if (!this.ready) {
-            try {
-                const parsed = JSON.parse(jsonString);
-                return parsed.profile || parsed || {};
-            } catch {
-                return {};
-            }
-        }
-
-        try {
-            return wasmParseProfile(jsonString);
-        } catch (e) {
-            console.error('[ContentSanitizer] parseProfile error:', e);
-            return {};
         }
     }
 
@@ -4701,15 +4921,11 @@ class ContentSanitizer {
     sanitizeBiography(rawBio, maxLength = 256) {
         if (!rawBio) return '';
 
-        if (!this.ready) {
-            return rawBio.replace(/<[^>]*>/g, '').slice(0, maxLength).trim();
-        }
-
         try {
-            return wasmSanitizeBiography(rawBio, maxLength);
+            return wasmSanitizeMemo(rawBio, maxLength);
         } catch (e) {
-            console.error('[ContentSanitizer] sanitizeBiography error:', e);
-            return rawBio.replace(/<[^>]*>/g, '').slice(0, maxLength).trim();
+            console.error('[ContentSanitizer] sanitizeMemo error:', e);
+            return '';
         }
     }
 
@@ -4720,11 +4936,6 @@ class ContentSanitizer {
      */
     sanitizeUsername(rawUsername) {
         if (!rawUsername) return '';
-
-        if (!this.ready) {
-            const cleaned = rawUsername.toLowerCase().trim();
-            return /^[a-z][a-z0-9.-]{2,15}$/.test(cleaned) ? cleaned : '';
-        }
 
         try {
             return wasmSanitizeUsername(rawUsername);
@@ -4738,16 +4949,15 @@ class ContentSanitizer {
      * Legacy compatibility: processBlogPost wraps renderPost
      * @param {string} body
      * @param {object} [options]
-     * @returns {{ sanitizedBody: string, html: string, images: Array, links: Array, wordCount: number }}
+     * @returns {{ body: string, _images: Array, _links: Array, _word_count: number }}
      */
     processBlogPost(body, options = {}) {
         const result = this.renderPost(body, options);
         return {
-            sanitizedBody: result.html,
-            html: result.html,
-            images: result.images,
-            links: result.links,
-            wordCount: result.wordCount,
+            body: result.html,
+            _images: result.images,
+            _links: result.links,
+            _word_count: result.wordCount,
         };
     }
 
@@ -4755,30 +4965,6 @@ class ContentSanitizer {
      * Fallback processing when WASM is not available
      * @private
      */
-    _fallbackProcess(body) {
-        const imageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
-        const images = [];
-        let match;
-        while ((match = imageRegex.exec(body)) !== null) {
-            images.push({ src: match[2], alt: match[1], is_base64: match[2].startsWith('data:'), index: images.length });
-        }
-
-        const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-        const links = [];
-        while ((match = linkRegex.exec(body)) !== null) {
-            if (!match[0].startsWith('!')) {
-                links.push({ href: match[2], text: match[1], domain: '', is_external: true });
-            }
-        }
-
-        return {
-            html: body,
-            images,
-            links,
-            wordCount: this._countWords(body),
-        };
-    }
-
     /**
      * Word count helper
      * @private
@@ -5410,11 +5596,14 @@ class SessionManager {
         try {
             if (!this.preferences || !this.sessions) return null;
 
-            const pref = await this.preferences.get('active_account');
+            let pref;
+            try { pref = await this.preferences.get('active_account'); } catch (_) { return null; }
             if (!pref || !pref.account) return null;
 
             const account = pref.account;
-            const sessionData = await this.sessions.get(account);
+
+            let sessionData;
+            try { sessionData = await this.sessions.get(account); } catch (_) { sessionData = null; }
 
             if (!sessionData) {
                 // Session record missing - clear stale preference
