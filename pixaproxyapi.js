@@ -69,6 +69,7 @@
  *   - formatAccount(account)
  *   - processPost(post, renderOptions)
  *   - processComment(comment, renderOptions)
+ *   - processMemo(memo)
  *   - extractPlainText(body)
  *   - summarizeContent(body, sentenceCount)
  *   - parseMetadata(jsonMetadataString)
@@ -251,8 +252,11 @@
 
 import { LacertaDB } from '@pixagram/lacerta-db';
 import pixaContentInit, {
-    renderPostBody,
-    renderCommentBody,
+    sanitizePost as wasmSanitizePost,
+    sanitizeComment as wasmSanitizeComment,
+    sanitizeMemo as wasmSanitizeMemo,
+    safeJson as wasmSafeJson,
+    safeString as wasmSafeString,
     extractPlainText as wasmExtractPlainText,
     summarizeContent as wasmSummarizeContent,
     parseMetadata as wasmParseMetadata,
@@ -325,10 +329,76 @@ const CONFIG = {
     DEFAULT_NODES: [
         'https://pixagram.dev'
     ],
-    APP_NAME: 'pixagram/3.4.0',
+    APP_NAME: 'pixagram/3.5.0',
     PAGINATION_LIMIT: 20,
     CHAIN_ID: null,
     ADDRESS_PREFIX: 'PIX'
+};
+
+// ============================================
+// VALIDATORS (v3.5.0) — JS-side format checks
+// ============================================
+
+const VALIDATORS = {
+    safe_asset: (s) => {
+        if (typeof s !== 'string') return null;
+        return /^\d{1,15}\.\d{3,6} [A-Z]{3,6}$/.test(s) ? s : null;
+    },
+    safe_permlink: (s) => {
+        if (typeof s !== 'string') return null;
+        const t = s.trim().toLowerCase();
+        return /^[a-z0-9][a-z0-9\-]{0,255}$/.test(t) ? t : null;
+    },
+    safe_url_path: (s) => {
+        if (typeof s !== 'string') return null;
+        const t = s.trim();
+        return /^\/@[a-z0-9][a-z0-9.\-]{1,15}\/[a-z0-9][a-z0-9\-]{0,255}(#.*)?$/.test(t) ? t : null;
+    },
+    safe_pubkey: (s) => {
+        if (typeof s !== 'string') return null;
+        return /^PIX[1-9A-HJ-NP-Za-km-z]{46,53}$/.test(s) ? s : null;
+    },
+    safe_iso_date: (s) => {
+        if (typeof s !== 'string') return null;
+        return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(s) ? s : null;
+    },
+    safe_number: (v) => {
+        return (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+    },
+    safe_bool: (v) => {
+        return (typeof v === 'boolean') ? v : null;
+    },
+    safe_numeric_string: (s) => {
+        if (typeof s !== 'string') return null;
+        return /^-?\d{1,30}$/.test(s) ? s : null;
+    },
+    safe_percent: (v) => {
+        if (typeof v !== 'number') return null;
+        return (Number.isInteger(v) && v >= 0 && v <= 10000) ? v : null;
+    },
+    safe_beneficiary: (b) => {
+        if (!b || typeof b !== 'object') return null;
+        const account = VALIDATORS.safe_username_js(b.account);
+        const weight = VALIDATORS.safe_percent(b.weight);
+        if (!account || weight === null) return null;
+        return { account, weight };
+    },
+    safe_username_js: (s) => {
+        if (typeof s !== 'string') return null;
+        const t = s.trim().toLowerCase();
+        if (t.length < 3 || t.length > 16) return null;
+        if (!/^[a-z][a-z0-9.\-]{2,15}$/.test(t)) return null;
+        if (/[.\-]{2}/.test(t)) return null;
+        if (/[.\-]$/.test(t)) return null;
+        return t;
+    },
+    safe_manabar: (m) => {
+        if (!m || typeof m !== 'object') return null;
+        return {
+            current_mana: String(m.current_mana || '0'),
+            last_update_time: VALIDATORS.safe_number(m.last_update_time) ?? 0,
+        };
+    },
 };
 
 // ============================================
@@ -1227,8 +1297,8 @@ export class PixaProxyAPI {
     formatAccount(account) {
         if (!account) return null;
 
-        // v3.4.0: If entity is already sanitized (from entity store), return it
-        if (account._entity_type === 'account' && account._stored_at) {
+        // v3.5.0: If entity is already sanitized (from entity store), return it
+        if (account._sanitized) {
             return account;
         }
 
@@ -1275,8 +1345,8 @@ export class PixaProxyAPI {
      */
     processPost(post, renderOptions = {}) {
         if (!post) return null;
-        // v3.4.0: If already sanitized by entity store, return directly
-        if (post._entity_type === 'post' && post.html !== undefined) return post;
+        // v3.5.0: If already sanitized by entity store, return directly
+        if (post._sanitized) return post;
 
         if (this.sanitizationPipeline) {
             return this.sanitizationPipeline.sanitizePost(post, renderOptions);
@@ -1306,8 +1376,8 @@ export class PixaProxyAPI {
      */
     processComment(comment, renderOptions = {}) {
         if (!comment) return null;
-        // v3.4.0: If already sanitized by entity store, return directly
-        if (comment._entity_type === 'comment' && comment.html !== undefined) return comment;
+        // v3.5.0: If already sanitized by entity store, return directly
+        if (comment._sanitized) return comment;
 
         if (this.sanitizationPipeline) {
             return this.sanitizationPipeline.sanitizeComment(comment, renderOptions);
@@ -1324,6 +1394,19 @@ export class PixaProxyAPI {
             wordCount: processed.wordCount,
             author_reputation: this.formatter.reputation(comment.author_reputation),
         };
+    }
+
+    /**
+     * Process a transaction memo for display.
+     * Bold, italic, @mentions, #hashtags only. No images, lists, or blocks.
+     * v0.2: New method using sanitizeMemo tier.
+     *
+     * @param {string} memo - Raw memo string
+     * @returns {{ html: string }} Sanitized memo
+     */
+    processMemo(memo) {
+        if (!memo) return { html: '' };
+        return this.contentSanitizer.renderMemo(memo);
     }
 
     /**
@@ -3845,57 +3928,71 @@ class SanitizationPipeline {
     sanitizeAccount(raw) {
         if (!raw || !raw.name) return null;
 
-        const sanitized = { ...raw };
+        const name = this.sanitizer.sanitizeUsername(raw.name);
+        if (!name) return null;
 
-        // Compute entity key
-        sanitized._entity_id = raw.name;
-        sanitized._entity_type = 'account';
-        sanitized._stored_at = Date.now();
-
-        // Reputation
-        sanitized.reputation_score = this.formatter
-            ? this.formatter.reputation(raw.reputation)
-            : 25;
-
-        // Parse and sanitize metadata
+        // Parse metadata through WASM (handles PIXA/HIVE/STEEM variants)
         const rawMeta = raw.posting_json_metadata || raw.json_metadata || '{}';
-        try {
-            const meta = this.sanitizer.parseMetadata(rawMeta);
-            sanitized.parsed_metadata = meta;
+        let meta = { profile: {}, tags: [], extra: {} };
+        try { meta = this.sanitizer.parseMetadata(rawMeta); } catch (e) {}
+        const profile = meta.profile || {};
 
-            if (meta.profile) {
-                // Sanitize display name from metadata
-                if (meta.profile.name) {
-                    sanitized.display_name = this.sanitizer.sanitizeBiography(meta.profile.name, 64);
-                }
-                // Sanitize biography
-                if (meta.profile.about) {
-                    sanitized.sanitized_about = this.sanitizer.sanitizeBiography(meta.profile.about, 512);
-                }
-                // Extract and validate profile image URL
-                if (meta.profile.profile_image) {
-                    sanitized.profile_image = meta.profile.profile_image;
-                }
-                if (meta.profile.cover_image) {
-                    sanitized.cover_image = meta.profile.cover_image;
-                }
-                if (meta.profile.location) {
-                    sanitized.sanitized_location = this.sanitizer.sanitizeBiography(meta.profile.location, 128);
-                }
-                if (meta.profile.website) {
-                    sanitized.sanitized_website = this.sanitizer.sanitizeBiography(meta.profile.website, 256);
-                }
-            }
-        } catch (e) {
-            // Non-critical — store raw, mark as parse-failed
-            sanitized.parsed_metadata = { profile: {}, tags: [], extra: {} };
-            sanitized._meta_parse_error = true;
-        }
+        // Build entity FIELD BY FIELD — no { ...raw } spread
+        return {
+            _entity_id: name,
+            _entity_type: 'account',
+            _sanitized: true,
+            _stored_at: Date.now(),
 
-        // Validate the on-chain username
-        sanitized.sanitized_name = this.sanitizer.sanitizeUsername(raw.name);
+            // Identity
+            name,
+            id: VALIDATORS.safe_number(raw.id) ?? 0,
 
-        return sanitized;
+            // Keep metadata as original strings (downstream does JSON.parse)
+            json_metadata:          raw.json_metadata || '{}',
+            posting_json_metadata:  raw.posting_json_metadata || '{}',
+            parsed_metadata:        meta,
+
+            // Reputation
+            reputation:      VALIDATORS.safe_number(raw.reputation) ?? 0,
+            reputation_score: this.formatter ? this.formatter.reputation(raw.reputation) : 25,
+
+            // Balances (validated asset format)
+            balance:                    VALIDATORS.safe_asset(raw.balance) || '0.000 PIXA',
+            savings_balance:            VALIDATORS.safe_asset(raw.savings_balance) || '0.000 PIXA',
+            pxs_balance:                VALIDATORS.safe_asset(raw.pxs_balance) || '0.000 PXS',
+            savings_pxs_balance:        VALIDATORS.safe_asset(raw.savings_pxs_balance) || '0.000 PXS',
+            vesting_shares:             VALIDATORS.safe_asset(raw.vesting_shares) || '0.000000 VESTS',
+            delegated_vesting_shares:   VALIDATORS.safe_asset(raw.delegated_vesting_shares) || '0.000000 VESTS',
+            received_vesting_shares:    VALIDATORS.safe_asset(raw.received_vesting_shares) || '0.000000 VESTS',
+            vesting_withdraw_rate:      VALIDATORS.safe_asset(raw.vesting_withdraw_rate) || '0.000000 VESTS',
+            reward_pixa_balance:        VALIDATORS.safe_asset(raw.reward_pixa_balance) || '0.000 PIXA',
+            reward_pxs_balance:         VALIDATORS.safe_asset(raw.reward_pxs_balance) || '0.000 PXS',
+            reward_vesting_balance:     VALIDATORS.safe_asset(raw.reward_vesting_balance) || '0.000000 VESTS',
+            reward_vesting_pixa:        VALIDATORS.safe_asset(raw.reward_vesting_pixa) || '0.000 PIXA',
+
+            // Voting / activity
+            voting_power:       VALIDATORS.safe_number(raw.voting_power) ?? 0,
+            voting_manabar:     VALIDATORS.safe_manabar(raw.voting_manabar),
+            post_count:         VALIDATORS.safe_number(raw.post_count) ?? 0,
+            created:            VALIDATORS.safe_iso_date(raw.created) || '',
+            last_post:          VALIDATORS.safe_iso_date(raw.last_post) || '',
+            last_vote_time:     VALIDATORS.safe_iso_date(raw.last_vote_time) || '',
+            witnesses_voted_for: VALIDATORS.safe_number(raw.witnesses_voted_for) ?? 0,
+
+            // Keys / proxy
+            memo_key:           VALIDATORS.safe_pubkey(raw.memo_key) || '',
+            proxy:              raw.proxy ? (this.sanitizer.sanitizeUsername(raw.proxy) || '') : '',
+
+            // Profile fields (from sanitized metadata)
+            sanitized_name:     name,
+            display_name:       profile.name ? this.sanitizer.sanitizeBiography(profile.name, 64) : null,
+            sanitized_about:    profile.about ? this.sanitizer.sanitizeBiography(profile.about, 512) : null,
+            profile_image:      typeof profile.profile_image === 'string' ? profile.profile_image : null,
+            cover_image:        typeof profile.cover_image === 'string' ? profile.cover_image : null,
+            sanitized_location: profile.location ? this.sanitizer.sanitizeBiography(profile.location, 128) : null,
+            sanitized_website:  profile.website ? this.sanitizer.sanitizeBiography(profile.website, 256) : null,
+        };
     }
 
     /**
@@ -3908,41 +4005,80 @@ class SanitizationPipeline {
     sanitizePost(raw, renderOptions = {}) {
         if (!raw || !raw.author || !raw.permlink) return null;
 
-        const sanitized = { ...raw };
-        const entityId = `${raw.author}_${raw.permlink}`;
+        const author = this.sanitizer.sanitizeUsername(raw.author);
+        const permlink = VALIDATORS.safe_permlink(raw.permlink);
+        if (!author || !permlink) return null;
 
-        sanitized._entity_id = entityId;
-        sanitized._entity_type = 'post';
-        sanitized._stored_at = Date.now();
+        const entityId = `${author}_${permlink}`;
 
-        // Render body through sanitizer
+        // Render body through WASM sanitizer
         const rendered = this.sanitizer.renderPost(raw.body || '', renderOptions);
-        sanitized.html = rendered.html;
-        sanitized.sanitizedBody = rendered.html;
-        sanitized.images = rendered.images;
-        sanitized.links = rendered.links;
-        sanitized.wordCount = rendered.wordCount;
 
-        // Plain text excerpt for search/preview
-        sanitized.plainText = this.sanitizer.extractPlainText(raw.body || '').slice(0, 500);
+        // Parse metadata through WASM
+        let meta = { profile: {}, tags: [], extra: {} };
+        try { meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}'); } catch (e) {}
 
-        // Reputation
-        sanitized.author_reputation = this.formatter
-            ? this.formatter.reputation(raw.author_reputation)
-            : 25;
+        // Build entity FIELD BY FIELD — no { ...raw } spread
+        return {
+            _entity_id: entityId,
+            _entity_type: 'post',
+            _sanitized: true,
+            _stored_at: Date.now(),
 
-        // Parse post metadata (tags, app, format, images)
-        try {
-            const meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}');
-            sanitized.parsed_metadata = meta;
-            sanitized.tags = meta.tags || [];
-            sanitized.app = meta.app || '';
-        } catch (e) {
-            sanitized.parsed_metadata = { profile: {}, tags: [], extra: {} };
-            sanitized.tags = [];
-        }
+            // Identity
+            author,
+            permlink,
+            category:        this.sanitizer.sanitizeBiography(raw.category || '', 64),
+            parent_author:   '',
+            parent_permlink: this.sanitizer.sanitizeBiography(raw.parent_permlink || '', 256),
 
-        return sanitized;
+            // Content (sanitized)
+            title:           this.sanitizer.sanitizeBiography(raw.title || '', 256),
+            body:            raw.body || '',
+            html:            rendered.html,
+            sanitizedBody:   rendered.html,
+            images:          rendered.images,
+            links:           rendered.links,
+            wordCount:       rendered.wordCount,
+            plainText:       this.sanitizer.extractPlainText(raw.body || '').slice(0, 500),
+
+            // Metadata (json_metadata stays as original string)
+            json_metadata:   raw.json_metadata || '{}',
+            parsed_metadata: meta,
+            tags:            meta.tags || [],
+            app:             typeof meta.app === 'string' ? meta.app : '',
+
+            // Timestamps
+            created:         VALIDATORS.safe_iso_date(raw.created) || '',
+            last_update:     VALIDATORS.safe_iso_date(raw.last_update) || '',
+
+            // Numbers
+            depth:           VALIDATORS.safe_number(raw.depth) ?? 0,
+            children:        VALIDATORS.safe_number(raw.children) ?? 0,
+            net_votes:       VALIDATORS.safe_number(raw.net_votes) ?? 0,
+            author_reputation: this.formatter ? this.formatter.reputation(raw.author_reputation) : 25,
+
+            // Economics
+            net_rshares:            VALIDATORS.safe_numeric_string(raw.net_rshares) || '0',
+            total_payout_value:     VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
+            curator_payout_value:   VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
+            pending_payout_value:   VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
+            max_accepted_payout:    VALIDATORS.safe_asset(raw.max_accepted_payout) || '1000000.000 PXS',
+            percent_pxs:            VALIDATORS.safe_percent(raw.percent_pxs) ?? 10000,
+
+            // Flags
+            allow_votes:             VALIDATORS.safe_bool(raw.allow_votes) ?? true,
+            allow_curation_rewards:  VALIDATORS.safe_bool(raw.allow_curation_rewards) ?? true,
+
+            // Beneficiaries
+            beneficiaries: Array.isArray(raw.beneficiaries)
+                ? raw.beneficiaries.map(VALIDATORS.safe_beneficiary).filter(Boolean)
+                : [],
+
+            // Derived
+            root_title:     this.sanitizer.sanitizeBiography(raw.root_title || '', 256),
+            url:            VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
+        };
     }
 
     /**
@@ -3955,35 +4091,65 @@ class SanitizationPipeline {
     sanitizeComment(raw, renderOptions = {}) {
         if (!raw || !raw.author || !raw.permlink) return null;
 
-        const sanitized = { ...raw };
-        const entityId = `${raw.author}_${raw.permlink}`;
+        const author = this.sanitizer.sanitizeUsername(raw.author);
+        const permlink = VALIDATORS.safe_permlink(raw.permlink);
+        if (!author || !permlink) return null;
 
-        sanitized._entity_id = entityId;
-        sanitized._entity_type = 'comment';
-        sanitized._stored_at = Date.now();
+        const entityId = `${author}_${permlink}`;
 
         // Render body through comment sanitizer (stricter)
         const rendered = this.sanitizer.renderComment(raw.body || '', renderOptions);
-        sanitized.html = rendered.html;
-        sanitized.sanitizedBody = rendered.html;
-        sanitized.images = rendered.images;
-        sanitized.links = rendered.links;
-        sanitized.wordCount = rendered.wordCount;
-
-        // Reputation
-        sanitized.author_reputation = this.formatter
-            ? this.formatter.reputation(raw.author_reputation)
-            : 25;
 
         // Parse comment metadata
-        try {
-            const meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}');
-            sanitized.parsed_metadata = meta;
-        } catch (e) {
-            sanitized.parsed_metadata = { profile: {}, tags: [], extra: {} };
-        }
+        let meta = { profile: {}, tags: [], extra: {} };
+        try { meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}'); } catch (e) {}
 
-        return sanitized;
+        // Build entity FIELD BY FIELD — no { ...raw } spread
+        return {
+            _entity_id: entityId,
+            _entity_type: 'comment',
+            _sanitized: true,
+            _stored_at: Date.now(),
+
+            // Identity
+            author,
+            permlink,
+            parent_author:   raw.parent_author ? (this.sanitizer.sanitizeUsername(raw.parent_author) || '') : '',
+            parent_permlink: VALIDATORS.safe_permlink(raw.parent_permlink) || '',
+
+            // Content
+            title:           '',
+            body:            raw.body || '',
+            html:            rendered.html,
+            sanitizedBody:   rendered.html,
+            images:          rendered.images,
+            links:           rendered.links,
+            wordCount:       rendered.wordCount,
+
+            // Metadata (json_metadata stays as original string)
+            json_metadata:   raw.json_metadata || '{}',
+            parsed_metadata: meta,
+
+            // Timestamps
+            created:         VALIDATORS.safe_iso_date(raw.created) || '',
+            last_update:     VALIDATORS.safe_iso_date(raw.last_update) || '',
+
+            // Numbers
+            depth:           VALIDATORS.safe_number(raw.depth) ?? 1,
+            children:        VALIDATORS.safe_number(raw.children) ?? 0,
+            net_votes:       VALIDATORS.safe_number(raw.net_votes) ?? 0,
+            author_reputation: this.formatter ? this.formatter.reputation(raw.author_reputation) : 25,
+
+            // Economics
+            net_rshares:            VALIDATORS.safe_numeric_string(raw.net_rshares) || '0',
+            pending_payout_value:   VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
+            total_payout_value:     VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
+            curator_payout_value:   VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
+
+            // Derived
+            root_title:     '',
+            url:            VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
+        };
     }
 
     /**
@@ -4069,6 +4235,10 @@ class EntityStoreManager {
      */
     async upsert(type, sanitizedEntity) {
         if (!sanitizedEntity || !sanitizedEntity._entity_id) return;
+        if (!sanitizedEntity._sanitized) {
+            console.warn(`[EntityStoreManager] Rejected unsanitized entity for ${type}`);
+            return;
+        }
         try {
             const store = await this._store(type);
             const id = sanitizedEntity._entity_id;
@@ -4253,18 +4423,11 @@ class ContentSanitizer {
         this.ready = false;
         this._initPromise = null;
 
-        /** @type {object} Default render options for posts */
-        this.defaultPostOptions = {
-            include_images: true,
+        /** @type {object} Default sanitize options (v0.2 SanitizeOptions) */
+        this.defaultOptions = {
+            internal_domains: ['pixa.pics'],
+            max_body_length: 500000,
             max_image_count: 0,
-            internal_domains: ['pixa.pics'],
-        };
-
-        /** @type {object} Default render options for comments */
-        this.defaultCommentOptions = {
-            include_images: true,
-            max_image_count: 10,
-            internal_domains: ['pixa.pics'],
         };
     }
 
@@ -4303,8 +4466,7 @@ class ContentSanitizer {
      */
     setInternalDomains(domains) {
         if (Array.isArray(domains)) {
-            this.defaultPostOptions.internal_domains = domains;
-            this.defaultCommentOptions.internal_domains = domains;
+            this.defaultOptions.internal_domains = domains;
         }
     }
 
@@ -4325,8 +4487,9 @@ class ContentSanitizer {
         }
 
         try {
-            const opts = { ...this.defaultPostOptions, ...options };
-            const result = renderPostBody(body, opts);
+            const opts = { ...this.defaultOptions, ...options };
+            // v0.2: sanitizePost(body, optsJson) → PostResult { html, images, links }
+            const result = wasmSanitizePost(body, JSON.stringify(opts));
 
             return {
                 html: result.html || '',
@@ -4356,18 +4519,85 @@ class ContentSanitizer {
         }
 
         try {
-            const opts = { ...this.defaultCommentOptions, ...options };
-            const result = renderCommentBody(body, opts);
+            const opts = { ...this.defaultOptions, ...options };
+            // v0.2: sanitizeComment(body, optsJson) → CommentResult { html, links } (no images)
+            const result = wasmSanitizeComment(body, JSON.stringify(opts));
 
             return {
                 html: result.html || '',
-                images: result.images || [],
+                images: [],  // v0.2: comments don't return images
                 links: result.links || [],
                 wordCount: this._countWords(result.html || body),
             };
         } catch (e) {
             console.error('[ContentSanitizer] renderComment error:', e);
             return this._fallbackProcess(body);
+        }
+    }
+
+    /**
+     * Render a memo (bold, italic, @mentions, #hashtags only)
+     * v0.2: New tier.
+     * @param {string} body
+     * @param {object} [options]
+     * @returns {{ html: string }}
+     */
+    renderMemo(body, options = {}) {
+        if (!body) return { html: '' };
+
+        if (!this.ready) {
+            return { html: body.replace(/<[^>]*>/g, '') };
+        }
+
+        try {
+            const opts = { ...this.defaultOptions, ...options };
+            return wasmSanitizeMemo(body, JSON.stringify(opts));
+        } catch (e) {
+            console.error('[ContentSanitizer] renderMemo error:', e);
+            return { html: body.replace(/<[^>]*>/g, '') };
+        }
+    }
+
+    /**
+     * Sanitize a JSON string — all keys validated, strings stripped.
+     * v0.2: New primitive.
+     * @param {string} jsonStr
+     * @returns {object}
+     */
+    safeJson(jsonStr) {
+        if (!jsonStr) return {};
+
+        if (!this.ready) {
+            try { return JSON.parse(jsonStr); } catch { return {}; }
+        }
+
+        try {
+            return wasmSafeJson(jsonStr);
+        } catch (e) {
+            console.error('[ContentSanitizer] safeJson error:', e);
+            return {};
+        }
+    }
+
+    /**
+     * Sanitize a single string value — strips HTML, rejects embedded JSON.
+     * v0.2: New primitive.
+     * @param {string} s
+     * @param {number} [maxLen=10000]
+     * @returns {string}
+     */
+    safeString(s, maxLen = 10000) {
+        if (!s || typeof s !== 'string') return '';
+
+        if (!this.ready) {
+            return s.replace(/<[^>]*>/g, '').slice(0, maxLen);
+        }
+
+        try {
+            return wasmSafeString(s, maxLen) || '';
+        } catch (e) {
+            console.error('[ContentSanitizer] safeString error:', e);
+            return '';
         }
     }
 
