@@ -33,7 +33,7 @@
  * - All entities are sanitized before DB insertion via SanitizationPipeline:
  *   - Posts: renderPost → html, images, links, wordCount; metadata parsed
  *   - Comments: renderComment → html, images, links (stricter subset)
- *   - Accounts: parseMetadata, sanitizeBiography, sanitizeUsername from json_metadata
+ *   - Accounts: safeJson on json_metadata, sanitizeUsername
  * - Added QueryCacheManager: query results stored as ID arrays only (relational)
  *   - Fresh queries resolve IDs from entity stores without re-fetching
  *   - Stale queries re-fetch, sanitize, upsert entities, then cache ID list
@@ -46,8 +46,8 @@
  * - Added processComment() for comment-specific rendering (restricted subset)
  * - Added extractPlainText() for clean text extraction
  * - Added summarizeContent() for TF-IDF extractive summarization
- * - Added parseMetadata() for PIXA/HIVE/STEEM JSON metadata parsing
- * - Added sanitizeBiography() and sanitizeUsername() helpers
+ * - Added safeJson() as single entry point for all JSON metadata sanitization
+ * - Added sanitizeUsername() helper
  * - processPost() now returns full RenderResult (html, images, links) from WASM
  * - @mention and #hashtag linking handled natively by pixa-content
  * - External link isolation with data-* attributes for React dialogs
@@ -94,8 +94,6 @@
  *   - processMemo(memo)
  *   - extractPlainText(body)
  *   - summarizeContent(body, sentenceCount)
- *   - parseMetadata(jsonMetadataString)
- *   - sanitizeBiography(rawBio, maxLength)
  *   - sanitizeUsername(rawUsername)
  *   - hasVaultConfig()
  *
@@ -281,8 +279,6 @@ import pixaContentInit, {
     safeString as wasmSafeString,
     extractPlainText as wasmExtractPlainText,
     summarizeContent as wasmSummarizeContent,
-    parseMetadata as wasmParseMetadata,
-    sanitizeBiography as wasmSanitizeBiography,
     sanitizeUsername as wasmSanitizeUsername,
 } from '@pixagram/sanitizer';
 import {
@@ -1432,11 +1428,13 @@ export class PixaProxyAPI {
         }
 
         // Legacy fallback — build field-by-field, NO spread of raw data.
-        // Dangerous fields keep their names but store PARSED safe objects.
-        let parsedPostingMeta = { profile: {}, tags: [], extra: {} };
-        let parsedJsonMeta    = { profile: {}, tags: [], extra: {} };
-        try { parsedPostingMeta = this.contentSanitizer.parseMetadata(account.posting_json_metadata || '{}'); } catch (e) {}
-        try { parsedJsonMeta    = this.contentSanitizer.parseMetadata(account.json_metadata || '{}'); } catch (e) {}
+        // Dangerous fields keep their names but store sanitized JSON strings.
+        const safePostingMetaStr = this.contentSanitizer.safeJson(account.posting_json_metadata || '{}');
+        const safeJsonMetaStr    = this.contentSanitizer.safeJson(account.json_metadata || '{}');
+        let parsedPostingMeta = {};
+        let parsedJsonMeta    = {};
+        try { parsedPostingMeta = JSON.parse(safePostingMetaStr); } catch (e) {}
+        try { parsedJsonMeta    = JSON.parse(safeJsonMetaStr); } catch (e) {}
         const profile = { ...(parsedJsonMeta.profile || {}), ...(parsedPostingMeta.profile || {}) };
 
         return {
@@ -1444,24 +1442,18 @@ export class PixaProxyAPI {
             _sanitized: true,
             _stored_at: Date.now(),
             _profile: {
-                display_name: profile.name || null,
-                about: profile.about
-                    ? this.contentSanitizer.sanitizeBiography(profile.about, 512)
-                    : null,
-                location: profile.location
-                    ? this.contentSanitizer.sanitizeBiography(profile.location, 128)
-                    : null,
-                website: profile.website
-                    ? this.contentSanitizer.sanitizeBiography(profile.website, 256)
-                    : null,
+                display_name: typeof profile.name === 'string' ? profile.name.slice(0, 64) : null,
+                about: typeof profile.about === 'string' ? profile.about.slice(0, 512) : null,
+                location: typeof profile.location === 'string' ? profile.location.slice(0, 128) : null,
+                website: typeof profile.website === 'string' ? profile.website.slice(0, 256) : null,
                 profile_image: profile.profile_image || null,
                 cover_image: profile.cover_image || null,
             },
             _links: [],
             name: account.name || '',
             id: account.id || 0,
-            json_metadata:         parsedJsonMeta,
-            posting_json_metadata: parsedPostingMeta,
+            json_metadata:         safeJsonMetaStr,
+            posting_json_metadata: safePostingMetaStr,
             reputation:       typeof account.reputation === 'number' ? account.reputation : 0,
             reputation_score: this.formatter.reputation(account.reputation),
             balance: account.balance || '0.000 PIXA',
@@ -1492,8 +1484,9 @@ export class PixaProxyAPI {
 
         // Legacy fallback — build field-by-field, NO spread of raw data.
         const processed = this.contentSanitizer.renderPost(post.body || '', renderOptions);
-        let meta = { profile: {}, tags: [], extra: {} };
-        try { meta = this.contentSanitizer.parseMetadata(post.json_metadata || '{}'); } catch (e) {}
+        const safeMetaStr = this.contentSanitizer.safeJson(post.json_metadata || '{}');
+        let meta = {};
+        try { meta = JSON.parse(safeMetaStr); } catch (e) {}
         return {
             _entity_type: 'post',
             _sanitized: true,
@@ -1507,7 +1500,7 @@ export class PixaProxyAPI {
             permlink: post.permlink || '',
             title: post.title || '',
             body: processed.html || '',
-            json_metadata: meta,
+            json_metadata: safeMetaStr,
             category: post.category || '',
             parent_author: post.parent_author || '',
             parent_permlink: post.parent_permlink || '',
@@ -1547,8 +1540,9 @@ export class PixaProxyAPI {
 
         // Legacy fallback — build field-by-field, NO spread of raw data.
         const processed = this.contentSanitizer.renderComment(comment.body || '', renderOptions);
-        let meta = { profile: {}, tags: [], extra: {} };
-        try { meta = this.contentSanitizer.parseMetadata(comment.json_metadata || '{}'); } catch (e) {}
+        const safeMetaStr = this.contentSanitizer.safeJson(comment.json_metadata || '{}');
+        let meta = {};
+        try { meta = JSON.parse(safeMetaStr); } catch (e) {}
         return {
             _entity_type: 'comment',
             _sanitized: true,
@@ -1561,7 +1555,7 @@ export class PixaProxyAPI {
             permlink: comment.permlink || '',
             title: '',
             body: processed.html || '',
-            json_metadata: meta,
+            json_metadata: safeMetaStr,
             parent_author: comment.parent_author || '',
             parent_permlink: comment.parent_permlink || '',
             created: VALIDATORS.safe_timestamp(comment.created),
@@ -1615,28 +1609,6 @@ export class PixaProxyAPI {
      */
     summarizeContent(body, sentenceCount = 3) {
         return this.contentSanitizer.summarize(body || '', sentenceCount);
-    }
-
-    /**
-     * Parse JSON metadata string (handles PIXA/HIVE/STEEM variants)
-     * Returns profile, tags, and extension fields.
-     *
-     * @param {string} jsonMetadataString - Raw json_metadata string from blockchain
-     * @returns {{ profile: object, tags: string[], extra: object }}
-     */
-    parseMetadata(jsonMetadataString) {
-        return this.contentSanitizer.parseMetadata(jsonMetadataString);
-    }
-
-    /**
-     * Sanitize biography HTML to plain text with length limit
-     *
-     * @param {string} rawBio - Raw biography string (may contain HTML)
-     * @param {number} [maxLength=256] - Maximum character length
-     * @returns {string} Sanitized plain text biography
-     */
-    sanitizeBiography(rawBio, maxLength = 256) {
-        return this.contentSanitizer.sanitizeBiography(rawBio, maxLength);
     }
 
     /**
@@ -4122,22 +4094,26 @@ class SanitizationPipeline {
         const name = this.sanitizer.sanitizeUsername(raw.name);
         if (!name) return null;
 
-        // DANGEROUS: parse raw JSON strings through WASM, store parsed result only
+        // DANGEROUS: sanitize raw JSON strings through WASM, store sanitized strings only
         const rawPostingMeta = raw.posting_json_metadata || '{}';
         const rawJsonMeta    = raw.json_metadata || '{}';
-        let postingMeta = { profile: {}, tags: [], extra: {} };
-        let jsonMeta    = { profile: {}, tags: [], extra: {} };
-        try { postingMeta = this.sanitizer.parseMetadata(rawPostingMeta); } catch (e) {}
-        try { jsonMeta    = this.sanitizer.parseMetadata(rawJsonMeta); } catch (e) {}
+        const safePostingMetaStr = this.sanitizer.safeJson(rawPostingMeta);
+        const safeJsonMetaStr    = this.sanitizer.safeJson(rawJsonMeta);
+
+        // Parse the safe strings locally for field extraction only
+        let postingMeta = {};
+        let jsonMeta    = {};
+        try { postingMeta = JSON.parse(safePostingMetaStr); } catch (e) {}
+        try { jsonMeta    = JSON.parse(safeJsonMetaStr); } catch (e) {}
 
         // Merge profile: posting_json_metadata takes priority
         const profile = { ...(jsonMeta.profile || {}), ...(postingMeta.profile || {}) };
 
-        // Sanitize profile fields
-        const displayName  = profile.name     ? this.sanitizer.sanitizeBiography(profile.name, 64)     : null;
-        const about        = profile.about    ? this.sanitizer.sanitizeBiography(profile.about, 512)   : null;
-        const location     = profile.location ? this.sanitizer.sanitizeBiography(profile.location, 128): null;
-        const website      = profile.website  ? this.sanitizer.sanitizeBiography(profile.website, 256) : null;
+        // Profile fields are already sanitized by safeJson (HTML stripped, schemes checked)
+        const displayName  = typeof profile.name     === 'string' ? profile.name.slice(0, 64)  : null;
+        const about        = typeof profile.about    === 'string' ? profile.about.slice(0, 512) : null;
+        const location     = typeof profile.location === 'string' ? profile.location.slice(0, 128) : null;
+        const website      = typeof profile.website  === 'string' ? profile.website.slice(0, 256) : null;
         const profileImage = typeof profile.profile_image === 'string' ? profile.profile_image : null;
         const coverImage   = typeof profile.cover_image   === 'string' ? profile.cover_image   : null;
 
@@ -4161,9 +4137,9 @@ class SanitizationPipeline {
             name,
             id: VALIDATORS.safe_number(raw.id) ?? 0,
 
-            // DANGEROUS fields — keep names, store PARSED safe objects
-            json_metadata:         jsonMeta,
-            posting_json_metadata: postingMeta,
+            // DANGEROUS fields — keep names, store sanitized JSON strings
+            json_metadata:         safeJsonMetaStr,
+            posting_json_metadata: safePostingMetaStr,
 
             // Authority objects (structured chain data, not user text)
             owner:   VALIDATORS.safe_authority(raw.owner),
@@ -4257,9 +4233,10 @@ class SanitizationPipeline {
         // DANGEROUS: body — sanitize through WASM, store only sanitized HTML
         const rendered = this.sanitizer.renderPost(raw.body || '', renderOptions);
 
-        // DANGEROUS: json_metadata — parse through WASM, store parsed object
-        let meta = { profile: {}, tags: [], extra: {} };
-        try { meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}'); } catch (e) {}
+        // DANGEROUS: json_metadata — sanitize through WASM, store as safe string
+        const safeMetaStr = this.sanitizer.safeJson(raw.json_metadata || '{}');
+        let meta = {};
+        try { meta = JSON.parse(safeMetaStr); } catch (e) {}
 
         // Build entity FIELD BY FIELD — no { ...raw } spread.
         return {
@@ -4280,16 +4257,16 @@ class SanitizationPipeline {
             id:              VALIDATORS.safe_number(raw.id) ?? 0,
             author,
             permlink,
-            category:        this.sanitizer.sanitizeBiography(raw.category || '', 64),
+            category:        this.sanitizer.safeString(raw.category || '', 64),
             parent_author:   '',
-            parent_permlink: this.sanitizer.sanitizeBiography(raw.parent_permlink || '', 256),
+            parent_permlink: this.sanitizer.safeString(raw.parent_permlink || '', 256),
 
             // Content — body IS sanitized HTML
-            title: this.sanitizer.sanitizeBiography(raw.title || '', 256),
+            title: this.sanitizer.safeString(raw.title || '', 256),
             body:  rendered.html || '',
 
-            // DANGEROUS field — keeps name, stores PARSED safe object
-            json_metadata: meta,
+            // DANGEROUS field — keeps name, stores sanitized JSON string
+            json_metadata: safeMetaStr,
 
             // Timestamps (integer ms)
             created:     VALIDATORS.safe_timestamp(raw.created),
@@ -4336,7 +4313,7 @@ class SanitizationPipeline {
 
             // Navigation / root
             url:           VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
-            root_title:    this.sanitizer.sanitizeBiography(raw.root_title || '', 256),
+            root_title:    this.sanitizer.safeString(raw.root_title || '', 256),
             root_author:   raw.root_author ? (this.sanitizer.sanitizeUsername(raw.root_author) || '') : '',
             root_permlink: VALIDATORS.safe_permlink(raw.root_permlink) || '',
         };
@@ -4366,8 +4343,9 @@ class SanitizationPipeline {
         const rendered = this.sanitizer.renderComment(raw.body || '', renderOptions);
 
         // DANGEROUS: json_metadata
-        let meta = { profile: {}, tags: [], extra: {} };
-        try { meta = this.sanitizer.parseMetadata(raw.json_metadata || '{}'); } catch (e) {}
+        const safeMetaStr = this.sanitizer.safeJson(raw.json_metadata || '{}');
+        let meta = {};
+        try { meta = JSON.parse(safeMetaStr); } catch (e) {}
 
         return {
             _entity_id:   entityId,
@@ -4391,8 +4369,8 @@ class SanitizationPipeline {
             title: '',
             body:  rendered.html || '',
 
-            // DANGEROUS field — keeps name, stores PARSED safe object
-            json_metadata: meta,
+            // DANGEROUS field — keeps name, stores sanitized JSON string
+            json_metadata: safeMetaStr,
 
             // Timestamps (integer ms)
             created:      VALIDATORS.safe_timestamp(raw.created),
@@ -4431,7 +4409,7 @@ class SanitizationPipeline {
 
             // Navigation / root
             url:           VALIDATORS.safe_url_path(raw.url) || `/@${author}/${permlink}`,
-            root_title:    this.sanitizer.sanitizeBiography(raw.root_title || '', 256),
+            root_title:    this.sanitizer.safeString(raw.root_title || '', 256),
             root_author:   raw.root_author ? (this.sanitizer.sanitizeUsername(raw.root_author) || '') : '',
             root_permlink: VALIDATORS.safe_permlink(raw.root_permlink) || '',
         };
@@ -4830,18 +4808,19 @@ class ContentSanitizer {
 
     /**
      * Sanitize a JSON string — all keys validated, strings stripped.
+     * Input: JSON string. Output: sanitized JSON string.
      * v0.2: New primitive.
      * @param {string} jsonStr
-     * @returns {object}
+     * @returns {string} Sanitized JSON string
      */
     safeJson(jsonStr) {
-        if (!jsonStr) return {};
+        if (!jsonStr) return '{}';
 
         try {
-            return JSON.parse(wasmSafeJson(jsonStr));
+            return wasmSafeJson(jsonStr);
         } catch (e) {
             console.error('[ContentSanitizer] safeJson error:', e);
-            return {};
+            return '{}';
         }
     }
 
@@ -4893,39 +4872,6 @@ class ContentSanitizer {
         } catch (e) {
             console.error('[ContentSanitizer] summarize error:', e);
             return { summary: '', keywords: [], sentences: [] };
-        }
-    }
-
-    /**
-     * Parse JSON metadata (handles PIXA/HIVE/STEEM variants)
-     * @param {string} jsonString
-     * @returns {{ profile: object, tags: string[], extra: object }}
-     */
-    parseMetadata(jsonString) {
-        if (!jsonString) return { profile: {}, tags: [], extra: {} };
-
-        try {
-            return JSON.parse(wasmParseMetadata(jsonString));
-        } catch (e) {
-            console.error('[ContentSanitizer] parseMetadata error:', e);
-            return { profile: {}, tags: [], extra: {} };
-        }
-    }
-
-    /**
-     * Sanitize biography HTML → plain text
-     * @param {string} rawBio
-     * @param {number} [maxLength=256]
-     * @returns {string}
-     */
-    sanitizeBiography(rawBio, maxLength = 256) {
-        if (!rawBio) return '';
-
-        try {
-            return wasmSanitizeMemo(rawBio, maxLength);
-        } catch (e) {
-            console.error('[ContentSanitizer] sanitizeMemo error:', e);
-            return '';
         }
     }
 
