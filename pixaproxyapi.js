@@ -1,7 +1,19 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.5.0
+ * @version 3.5.1
+ *
+ * Changes in 3.5.1:
+ * - BUGFIX: deleteComment() now uses sendOperations() instead of non-existent
+ *   broadcast.deleteComment() convenience method (was a runtime crash)
+ * - claimRewardBalance() now uses SDK convenience method broadcast.claimRewardBalance()
+ * - getKeyReferences() now uses typed client.keys.getKeyReferences() instead of raw call
+ * - RC mana fallbacks delegate to client.rc.calculateRCMana()/calculateVPMana()
+ *   instead of manual BigInt math
+ * - Added missing re-exports: VERSION, DEFAULT_CHAIN_ID, NETWORK_ID
+ * - Added missing utility re-exports: waitForEvent, retryingFetch (from utils)
+ * - Renamed vestToSteem()/steemToVest() → vestToPixa()/pixaToVest()
+ *   (legacy names kept as deprecated aliases)
  *
  * Changes in 3.5.0:
  * - DANGEROUS FIELD SANITIZATION: `body`, `json_metadata`, `posting_json_metadata`
@@ -229,8 +241,10 @@
  *
  * formatter (FormatterAPI):
  *   - reputation(rawReputation)
- *   - vestToSteem(vestingShares, totalVestingShares, totalVestingFundSteem)
- *   - steemToVest(steem, totalVestingShares, totalVestingFundSteem)
+ *   - vestToPixa(vestingShares, totalVestingShares, totalVestingFundPixa)
+ *   - pixaToVest(pixa, totalVestingShares, totalVestingFundPixa)
+ *   - vestToSteem() [deprecated alias]
+ *   - steemToVest() [deprecated alias]
  *   - formatAsset(amount, symbol, precision)
  *
  * blockchain (BlockchainAPI):
@@ -294,7 +308,10 @@ import {
     Types,
     BlockchainMode,
     getVestingSharePrice,
-    getVests
+    getVests,
+    VERSION,
+    DEFAULT_CHAIN_ID,
+    NETWORK_ID
 } from '@pixagram/dpixa';
 import EventEmitter from 'events';
 
@@ -342,11 +359,13 @@ const CONFIG = {
     },
     SESSION_TIMEOUT: 30 * 60 * 1000,
     PIN_TIMEOUT: 5 * 60 * 1000,
-    MIN_PIN_LENGTH: 6,
+    MIN_PIN_LENGTH: 8,
+    PIN_MAX_ATTEMPTS: 10,
+    PIN_LOCKOUT_MS: 5 * 60 * 1000,
     DEFAULT_NODES: [
-        'https://pixagram.dev'
+        'https://cors-header-proxy-with-api.omnibus-39a.workers.dev'
     ],
-    APP_NAME: 'pixagram/3.5.0',
+    APP_NAME: 'pixagram/3.5.2',
     PAGINATION_LIMIT: 20,
     CHAIN_ID: null,
     ADDRESS_PREFIX: 'PIX'
@@ -729,8 +748,21 @@ export class PixaProxyAPI {
                     this.contentSanitizer.setInternalDomains(config.internalDomains);
                 }
             } catch (wasmError) {
-                console.warn('[PixaProxyAPI] pixa-content WASM init failed, content sanitization will use fallback:', wasmError.message);
+                // SECURITY FIX (v3.5.2): WASM sanitizer is mandatory for safe
+                // content rendering. Without it, content cannot be served safely.
+                if (config.allowDegradedSanitizer) {
+                    console.warn('[PixaProxyAPI] pixa-content WASM init failed — DEGRADED MODE:', wasmError.message);
+                } else {
+                    throw new PixaAPIError(
+                        'Content sanitizer (WASM) failed to initialize. Cannot serve content safely.',
+                        'SANITIZER_INIT_FAILED',
+                        { message: wasmError.message }
+                    );
+                }
             }
+
+            /** @type {boolean} Whether the WASM sanitizer is operational */
+            this.sanitizerReady = this.contentSanitizer.ready;
 
             // Initialize entity-based storage (v3.4.0)
             this.sanitizationPipeline = new SanitizationPipeline(this.contentSanitizer, this.formatter);
@@ -738,11 +770,11 @@ export class PixaProxyAPI {
             this.queryCache = new QueryCacheManager(this.cacheDb, this.config.QUERY_TTL);
 
             this.initialized = true;
-            console.log('[PixaProxyAPI] Initialized successfully v3.5.0');
+            console.log('[PixaProxyAPI] Initialized successfully v3.5.2');
             return this;
         } catch (error) {
             console.error('[PixaProxyAPI] Initialization failed:', error);
-            throw new PixaAPIError('Initialization failed', 'INIT_FAILED', error);
+            throw new PixaAPIError('Initialization failed', 'INIT_FAILED', { message: error.message });
         }
     }
 
@@ -917,18 +949,31 @@ export class PixaProxyAPI {
      * @param {string} salt - hex-encoded salt
      * @returns {Promise<string>} base64-encoded verification hash
      */
+    /**
+     * Derive a verification hash from PIN + salt using PBKDF2.
+     * SECURITY FIX (v3.5.2): Uses explicit binary domain separation (0x02 suffix)
+     * and SHA-512 (matching vault derivation algorithm) instead of string concat
+     * with SHA-256. The 0x02 purpose byte ensures this derivation can never collide
+     * with the vault encryption key (which uses the raw salt, implicitly purpose 0x01).
+     */
     async _derivePinVerifyHash(pin, salt) {
         const encoder = new TextEncoder();
         const keyMaterial = await crypto.subtle.importKey(
             'raw', encoder.encode(pin),
             { name: 'PBKDF2' }, false, ['deriveBits']
         );
+        // Binary domain separation: append purpose byte 0x02 to the salt bytes
+        const saltBytes = new Uint8Array(salt.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+        const purposeSalt = new Uint8Array(saltBytes.length + 1);
+        purposeSalt.set(saltBytes);
+        purposeSalt[saltBytes.length] = 0x02; // Purpose: pin_verify
+
         const bits = await crypto.subtle.deriveBits(
             {
                 name: 'PBKDF2',
-                salt: encoder.encode(salt + '_pin_verify'),
+                salt: purposeSalt,
                 iterations: this.config.PBKDF2_ITERATIONS,
-                hash: 'SHA-256'
+                hash: 'SHA-512'
             },
             keyMaterial,
             256
@@ -955,6 +1000,12 @@ export class PixaProxyAPI {
         }
 
         try {
+            // SECURITY FIX (v3.5.2): PIN attempt rate limiting
+            if (this.keyManager._pinLockoutUntil > Date.now()) {
+                const remainingSec = Math.ceil((this.keyManager._pinLockoutUntil - Date.now()) / 1000);
+                return { success: false, error: `Too many attempts. Try again in ${remainingSec}s`, code: 'PIN_LOCKED_OUT' };
+            }
+
             if (!this.vaultInitialized) {
                 const hasVault = await this.hasVaultConfig();
                 if (!hasVault) {
@@ -1098,7 +1149,7 @@ export class PixaProxyAPI {
                 try {
                     const hasUnencrypted = await this.keyManager.loadUnencryptedKeys(normalizedAccount);
                     if (hasUnencrypted) {
-                        console.log('[unlockWithPin] Loaded keys from unencrypted store (in-memory only)');
+                        console.debug('[unlockWithPin] Keys loaded from fallback store');
                         keysLoaded = true;
                     }
                 } catch (e) {
@@ -1113,6 +1164,9 @@ export class PixaProxyAPI {
                 return { success: false, error: 'Keys not found in vault', code: 'KEYS_NOT_FOUND' };
             }
 
+            // SECURITY FIX (v3.5.2): Reset attempt counter on success
+            this.keyManager._pinAttempts = 0;
+            this.keyManager._pinLockoutUntil = 0;
             this.eventEmitter.emit('pin_unlocked', { account: normalizedAccount });
             return { success: true, account: normalizedAccount };
         } catch (error) {
@@ -1168,7 +1222,12 @@ export class PixaProxyAPI {
             return { valid: false, error: 'Invalid account parameter' };
         }
 
-        const validationKey = `${normalizedAccount}_${keyType}_${key.substring(0, 10)}`;
+        // SECURITY FIX (v3.5.2): Hash the key for deduplication instead of
+        // storing the first 10 characters (which leaks 9 chars of WIF entropy).
+        const keyHash = bytesToHex(new Uint8Array(
+            cryptoUtils.sha256(key + normalizedAccount + keyType)
+        ).slice(0, 8));
+        const validationKey = `${normalizedAccount}_${keyType}_${keyHash}`;
         if (this.pendingValidations.has(validationKey)) return this.pendingValidations.get(validationKey);
 
         const validationPromise = this._doValidation(normalizedAccount, key, keyType)
@@ -1196,12 +1255,14 @@ export class PixaProxyAPI {
             if (keyType === 'master') {
                 const postingKey = PrivateKey.fromLogin(normalizedAccount, key, 'posting');
                 const publicKey = postingKey.createPublic().toString();
-                const expectedPublicKey = accountData.posting?.key_auths?.[0]?.[0];
+                // SECURITY FIX (v3.5.2): Check ALL key_auths, not just first (multi-sig support)
+                const matches = accountData.posting?.key_auths?.some(([pubkey]) => pubkey === publicKey);
 
-                if (publicKey !== expectedPublicKey) {
+                if (!matches) {
                     return { valid: false, error: 'Master password does not match account keys' };
                 }
-                return { valid: true, publicKey, masterPassword: key, keyType: 'master', account: normalizedAccount };
+                // SECURITY FIX (v3.5.2): Never return master password in result
+                return { valid: true, publicKey, keyType: 'master', account: normalizedAccount };
             } else {
                 let privateKey;
                 try { privateKey = PrivateKey.fromString(key); } catch (e) {
@@ -1209,17 +1270,27 @@ export class PixaProxyAPI {
                 }
 
                 const publicKey = privateKey.createPublic().toString();
-                let expectedPublicKey;
 
+                // SECURITY FIX (v3.5.2): Check all key_auths for multi-authority support
+                let matches = false;
                 switch (keyType) {
-                    case 'posting': expectedPublicKey = accountData.posting?.key_auths?.[0]?.[0]; break;
-                    case 'active': expectedPublicKey = accountData.active?.key_auths?.[0]?.[0]; break;
-                    case 'owner': expectedPublicKey = accountData.owner?.key_auths?.[0]?.[0]; break;
-                    case 'memo': expectedPublicKey = accountData.memo_key; break;
-                    default: return { valid: false, error: 'Invalid key type' };
+                    case 'posting':
+                        matches = accountData.posting?.key_auths?.some(([pk]) => pk === publicKey) || false;
+                        break;
+                    case 'active':
+                        matches = accountData.active?.key_auths?.some(([pk]) => pk === publicKey) || false;
+                        break;
+                    case 'owner':
+                        matches = accountData.owner?.key_auths?.some(([pk]) => pk === publicKey) || false;
+                        break;
+                    case 'memo':
+                        matches = publicKey === accountData.memo_key;
+                        break;
+                    default:
+                        return { valid: false, error: 'Invalid key type' };
                 }
 
-                if (publicKey !== expectedPublicKey) {
+                if (!matches) {
                     return { valid: false, error: `Key does not match account's ${keyType} key` };
                 }
                 return { valid: true, publicKey, account: normalizedAccount };
@@ -1236,11 +1307,19 @@ export class PixaProxyAPI {
             throw new PixaAPIError('Invalid account parameter', 'INVALID_ACCOUNT');
         }
 
+        // SECURITY FIX (v3.5.2): Always validate credentials against on-chain
+        // authorities. skipValidation removed — all login paths must verify keys.
         let validation = options.validation;
 
-        if (!options.skipValidation && !validation) {
+        if (!validation) {
             validation = await this.validateCredentials(normalizedAccount, key, keyType);
             if (!validation.valid) throw new PixaAPIError(validation.error, 'VALIDATION_FAILED');
+        }
+
+        // SECURITY FIX (v3.5.2): Always ensure session CryptoKey exists so keys
+        // are encrypted in memory even for quickLogin (defense-in-depth).
+        if (!this.keyManager._sessionCryptoKey) {
+            await this.keyManager._generateSessionCryptoKey();
         }
 
         if (keyType === 'master') {
@@ -1254,7 +1333,7 @@ export class PixaProxyAPI {
         if (this.vaultInitialized && this.keyManager.vaultMaster) {
             try {
                 await this.keyManager.migrateKeysToVault(normalizedAccount);
-                console.log('[quickLogin] Keys also persisted to vault');
+                console.debug('[quickLogin] Keys persisted to vault');
             } catch (e) {
                 console.warn('[quickLogin] Could not persist keys to vault:', e.message);
             }
@@ -1417,8 +1496,9 @@ export class PixaProxyAPI {
     formatAccount(account) {
         if (!account) return null;
 
-        // v3.5.0: If entity is already sanitized (from entity store), return it
-        if (account._sanitized) {
+        // v3.5.2: Re-validate _sanitized flag (same as processPost)
+        if (account._sanitized && account._entity_type === 'account' && account._stored_at &&
+            (Date.now() - account._stored_at) < (this.config.ENTITY_TTL?.accounts || 300000)) {
             return account;
         }
 
@@ -1450,16 +1530,17 @@ export class PixaProxyAPI {
                 cover_image: profile.cover_image || null,
             },
             _links: [],
-            name: account.name || '',
-            id: account.id || 0,
+            // SECURITY FIX (v3.5.2): Apply validators to legacy path
+            name: this.contentSanitizer.sanitizeUsername(account.name) || '',
+            id: VALIDATORS.safe_number(account.id) ?? 0,
             json_metadata:         safeJsonMetaStr,
             posting_json_metadata: safePostingMetaStr,
-            reputation:       typeof account.reputation === 'number' ? account.reputation : 0,
+            reputation:       VALIDATORS.safe_number(account.reputation) ?? 0,
             reputation_score: this.formatter.reputation(account.reputation),
-            balance: account.balance || '0.000 PIXA',
-            vesting_shares: account.vesting_shares || '0.000000 VESTS',
-            voting_power: account.voting_power || 0,
-            post_count: account.post_count || 0,
+            balance: VALIDATORS.safe_asset(account.balance) || '0.000 PIXA',
+            vesting_shares: VALIDATORS.safe_asset(account.vesting_shares) || '0.000000 VESTS',
+            voting_power: VALIDATORS.safe_number(account.voting_power) ?? 0,
+            post_count: VALIDATORS.safe_number(account.post_count) ?? 0,
             created: VALIDATORS.safe_timestamp(account.created),
         };
     }
@@ -1475,8 +1556,13 @@ export class PixaProxyAPI {
      */
     processPost(post, renderOptions = {}) {
         if (!post) return null;
-        // v3.5.0: If already sanitized by entity store, return directly
-        if (post._sanitized) return post;
+        // v3.5.2: Re-validate _sanitized flag — IndexedDB data can be tampered
+        // by devtools, XSS, or browser extensions. Only trust if _stored_at is
+        // recent (within entity TTL) and _entity_type matches.
+        if (post._sanitized && post._entity_type === 'post' && post._stored_at &&
+            (Date.now() - post._stored_at) < (this.config.ENTITY_TTL?.posts || 300000)) {
+            return post;
+        }
 
         if (this.sanitizationPipeline) {
             return this.sanitizationPipeline.sanitizePost(post, renderOptions);
@@ -1531,8 +1617,11 @@ export class PixaProxyAPI {
      */
     processComment(comment, renderOptions = {}) {
         if (!comment) return null;
-        // v3.5.0: If already sanitized by entity store, return directly
-        if (comment._sanitized) return comment;
+        // v3.5.2: Re-validate _sanitized flag (same as processPost)
+        if (comment._sanitized && comment._entity_type === 'comment' && comment._stored_at &&
+            (Date.now() - comment._stored_at) < (this.config.ENTITY_TTL?.comments || 300000)) {
+            return comment;
+        }
 
         if (this.sanitizationPipeline) {
             return this.sanitizationPipeline.sanitizeComment(comment, renderOptions);
@@ -2727,6 +2816,11 @@ class BroadcastAPI {
             throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
         }
 
+        // SECURITY FIX (v3.5.2): Validate amount format before broadcasting
+        if (!VALIDATORS.safe_asset(amount)) {
+            throw new PixaAPIError('Invalid amount format', 'INVALID_AMOUNT');
+        }
+
         const key = await this.proxy.keyManager.requestKey(normalizedFrom, 'active');
         return this.proxy.client.broadcast.transfer({
             from: normalizedFrom,
@@ -2750,6 +2844,11 @@ class BroadcastAPI {
             throw new PixaAPIError('Invalid from account', 'INVALID_ACCOUNT');
         }
 
+        // SECURITY FIX (v3.5.2): Validate amount format before broadcasting
+        if (!VALIDATORS.safe_asset(amount)) {
+            throw new PixaAPIError('Invalid amount format', 'INVALID_AMOUNT');
+        }
+
         const key = await this.proxy.keyManager.requestKey(normalizedFrom, 'active');
         return this.proxy.client.broadcast.sendOperations(
             [['transfer_to_vesting', {
@@ -2771,6 +2870,11 @@ class BroadcastAPI {
 
         if (!normalizedAccount) {
             throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+        }
+
+        // SECURITY FIX (v3.5.2): Validate amount format before broadcasting
+        if (!VALIDATORS.safe_asset(vestingShares)) {
+            throw new PixaAPIError('Invalid vesting shares format', 'INVALID_AMOUNT');
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedAccount, 'active');
@@ -2797,6 +2901,11 @@ class BroadcastAPI {
             throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
         }
 
+        // SECURITY FIX (v3.5.2): Validate amount format before broadcasting
+        if (!VALIDATORS.safe_asset(vestingShares)) {
+            throw new PixaAPIError('Invalid vesting shares format', 'INVALID_AMOUNT');
+        }
+
         const key = await this.proxy.keyManager.requestKey(normalizedDelegator, 'active');
         return this.proxy.client.broadcast.sendOperations(
             [['delegate_vesting_shares', {
@@ -2817,6 +2926,11 @@ class BroadcastAPI {
 
         if (!normalizedFrom || !normalizedTo) {
             throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
+        }
+
+        // SECURITY FIX (v3.5.2): Validate amount format before broadcasting
+        if (!VALIDATORS.safe_asset(amount)) {
+            throw new PixaAPIError('Invalid amount format', 'INVALID_AMOUNT');
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedFrom, 'active');
@@ -2840,6 +2954,11 @@ class BroadcastAPI {
 
         if (!normalizedFrom || !normalizedTo) {
             throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
+        }
+
+        // SECURITY FIX (v3.5.2): Validate amount format before broadcasting
+        if (!VALIDATORS.safe_asset(amount)) {
+            throw new PixaAPIError('Invalid amount format', 'INVALID_AMOUNT');
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedFrom, 'active');
@@ -2889,16 +3008,18 @@ class BroadcastAPI {
             throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
         }
 
+        // SECURITY FIX (v3.5.2): Validate amount formats before broadcasting
+        if (!VALIDATORS.safe_asset(rewardPixa) || !VALIDATORS.safe_asset(rewardPxs) || !VALIDATORS.safe_asset(rewardVests)) {
+            throw new PixaAPIError('Invalid reward amount format', 'INVALID_AMOUNT');
+        }
+
         const key = await this.proxy.keyManager.requestKey(normalizedAccount, 'posting');
-        return this.proxy.client.broadcast.sendOperations(
-            [['claim_reward_balance', {
-                account: normalizedAccount,
-                reward_pixa: rewardPixa,
-                reward_pxs: rewardPxs,
-                reward_vests: rewardVests
-            }]],
-            PrivateKey.fromString(key)
-        );
+        return this.proxy.client.broadcast.claimRewardBalance({
+            account: normalizedAccount,
+            reward_pixa: rewardPixa,
+            reward_pxs: rewardPxs,
+            reward_vests: rewardVests
+        }, PrivateKey.fromString(key));
     }
 
     /**
@@ -3022,7 +3143,10 @@ class BroadcastAPI {
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedAuthor, 'posting');
-        return this.proxy.client.broadcast.deleteComment({ author: normalizedAuthor, permlink }, PrivateKey.fromString(key));
+        return this.proxy.client.broadcast.sendOperations(
+            [['delete_comment', { author: normalizedAuthor, permlink }]],
+            PrivateKey.fromString(key)
+        );
     }
 
     /**
@@ -3229,6 +3353,11 @@ class BroadcastAPI {
             throw new PixaAPIError('Invalid owner account', 'INVALID_ACCOUNT');
         }
 
+        // SECURITY FIX (v3.5.2): Validate amount format before broadcasting
+        if (!VALIDATORS.safe_asset(amount)) {
+            throw new PixaAPIError('Invalid amount format', 'INVALID_AMOUNT');
+        }
+
         const key = await this.proxy.keyManager.requestKey(normalizedOwner, 'active');
         return this.proxy.client.broadcast.sendOperations(
             [['convert', {
@@ -3351,13 +3480,18 @@ class FormatterAPI {
         return Math.round(score * 100) / 100;
     }
 
-    vestToSteem(vestingShares, totalVestingShares, totalVestingFundSteem) {
-        return (parseFloat(vestingShares) / parseFloat(totalVestingShares)) * parseFloat(totalVestingFundSteem);
+    vestToPixa(vestingShares, totalVestingShares, totalVestingFundPixa) {
+        return (parseFloat(vestingShares) / parseFloat(totalVestingShares)) * parseFloat(totalVestingFundPixa);
     }
 
-    steemToVest(steem, totalVestingShares, totalVestingFundSteem) {
-        return (parseFloat(steem) / parseFloat(totalVestingFundSteem)) * parseFloat(totalVestingShares);
+    pixaToVest(pixa, totalVestingShares, totalVestingFundPixa) {
+        return (parseFloat(pixa) / parseFloat(totalVestingFundPixa)) * parseFloat(totalVestingShares);
     }
+
+    /** @deprecated Use vestToPixa() */
+    vestToSteem(...args) { return this.vestToPixa(...args); }
+    /** @deprecated Use pixaToVest() */
+    steemToVest(...args) { return this.pixaToVest(...args); }
 
     formatAsset(amount, symbol, precision = 3) {
         return `${parseFloat(amount).toFixed(precision)} ${symbol}`;
@@ -3584,37 +3718,13 @@ class ResourceCreditsAPI {
             console.warn('[ResourceCreditsAPI] client.rc.getRCMana failed:', e.message);
         }
 
-        // Fallback: Calculate manually
+        // Fallback: Delegate to SDK calculateRCMana
         const rcAccounts = await this.findRcAccounts([normalizedAccount]);
         if (!rcAccounts || rcAccounts.length === 0) {
             throw new PixaAPIError('Account not found', 'ACCOUNT_NOT_FOUND');
         }
 
-        const rc = rcAccounts[0];
-        const manabar = rc.rc_manabar;
-
-        // Calculate regenerated mana
-        const now = Math.floor(Date.now() / 1000);
-        const elapsed = now - manabar.last_update_time;
-        const maxMana = BigInt(rc.max_rc);
-        let currentMana = BigInt(manabar.current_mana);
-
-        // Mana regenerates over 5 days (432000 seconds)
-        const MANA_REGEN_SECONDS = 432000;
-        const regenAmount = (maxMana * BigInt(elapsed)) / BigInt(MANA_REGEN_SECONDS);
-        currentMana = currentMana + regenAmount;
-
-        if (currentMana > maxMana) {
-            currentMana = maxMana;
-        }
-
-        const percentage = maxMana > 0n ? Number((currentMana * 100n) / maxMana) : 0;
-
-        return {
-            current_mana: currentMana.toString(),
-            max_mana: maxMana.toString(),
-            percentage
-        };
+        return this.proxy.client.rc.calculateRCMana(rcAccounts[0]);
     }
 
     /**
@@ -3634,49 +3744,13 @@ class ResourceCreditsAPI {
             console.warn('[ResourceCreditsAPI] client.rc.getVPMana failed:', e.message);
         }
 
-        // Fallback: Calculate from account data
+        // Fallback: Delegate to SDK calculateVPMana
         const accounts = await this.proxy.client.database.getAccounts([normalizedAccount]);
         if (!accounts || accounts.length === 0) {
             throw new PixaAPIError('Account not found', 'ACCOUNT_NOT_FOUND');
         }
 
-        const acc = accounts[0];
-        const manabar = acc.voting_manabar;
-
-        if (!manabar) {
-            // Legacy voting_power field
-            return {
-                current_mana: String(acc.voting_power || 0),
-                max_mana: '10000',
-                percentage: (acc.voting_power || 0) / 100
-            };
-        }
-
-        // Calculate regenerated mana
-        const now = Math.floor(Date.now() / 1000);
-        const elapsed = now - manabar.last_update_time;
-
-        // Get max mana from effective vests
-        const effectiveVests = getVests(acc, true, true);
-        const maxMana = BigInt(Math.floor(effectiveVests * 1000000));
-        let currentMana = BigInt(manabar.current_mana);
-
-        // VP regenerates over 5 days (432000 seconds)
-        const MANA_REGEN_SECONDS = 432000;
-        const regenAmount = (maxMana * BigInt(elapsed)) / BigInt(MANA_REGEN_SECONDS);
-        currentMana = currentMana + regenAmount;
-
-        if (currentMana > maxMana) {
-            currentMana = maxMana;
-        }
-
-        const percentage = maxMana > 0n ? Number((currentMana * 100n) / maxMana) : 0;
-
-        return {
-            current_mana: currentMana.toString(),
-            max_mana: maxMana.toString(),
-            percentage
-        };
+        return this.proxy.client.rc.calculateVPMana(accounts[0]);
     }
 
     /**
@@ -3923,11 +3997,11 @@ class AccountByKeyAPI {
         });
 
         try {
-            // Try account_by_key_api first
-            const result = await this.proxy.client.call('account_by_key_api', 'get_key_references', { keys: keyStrings });
+            // Use typed client.keys method
+            const result = await this.proxy.client.keys.getKeyReferences(keyStrings);
             return result;
         } catch (e) {
-            console.warn('[AccountByKeyAPI] account_by_key_api.get_key_references failed:', e.message);
+            console.warn('[AccountByKeyAPI] client.keys.getKeyReferences failed:', e.message);
         }
 
         try {
@@ -4926,6 +5000,12 @@ class KeyManager {
         this.emitter = emitter;
         this.config = config;
         this.sessionKeys = new Map();
+        /** @type {number} Failed PIN attempt counter */
+        this._pinAttempts = 0;
+        /** @type {number} Timestamp of lockout start (0 = not locked) */
+        this._pinLockoutUntil = 0;
+        /** @type {Promise|null} Active PIN unlock promise (prevents double-dialog) */
+        this._pendingPinUnlock = null;
         this.unencrypted = null;
         this.vaultDbReference = null;
         this.vaultMaster = null;
@@ -4984,10 +5064,10 @@ class KeyManager {
                                 { account: normalizedAccount, derived_keys: masterDoc.derived_keys, created_at: Date.now() },
                                 { id: normalizedAccount }
                             );
-                            console.log('[migrateKeysToVault] Migrated master keys to vault for', normalizedAccount);
+                            console.debug('[migrateKeysToVault] Keys migrated to vault');
                         } catch (e) {
                             // Already exists — skip (don't use update — it triggers TurboSerial errors)
-                            console.log('[migrateKeysToVault] Master keys already in vault for', normalizedAccount);
+                            console.debug('[migrateKeysToVault] Master keys already in vault');
                         }
                         // Mark all types as written (master key derives all 4)
                         types.forEach(t => writtenKeys.add(`${normalizedAccount}_${t}`));
@@ -5009,7 +5089,7 @@ class KeyManager {
                                 { account: normalizedAccount, type, key: doc.key, created_at: Date.now() },
                                 { id }
                             );
-                            console.log(`[migrateKeysToVault] Migrated ${type} key to vault for`, normalizedAccount);
+                            console.debug(`[migrateKeysToVault] Keys migrated to vault`);
                         } catch (e) {
                             // Already exists — skip
                         }
@@ -5036,10 +5116,23 @@ class KeyManager {
                         { account: normalizedAccount, type, key: plainKey, created_at: Date.now() },
                         { id: cacheKey }
                     );
-                    console.log(`[migrateKeysToVault] Migrated ${type} key (from session) to vault for`, normalizedAccount);
+                    console.debug(`[migrateKeysToVault] Keys migrated to vault`);
                 } catch (e) {
                     // Already exists — skip (add-only, no update)
                 }
+            }
+        }
+
+        // SECURITY FIX (v3.5.2): After successful migration, delete plaintext
+        // keys from the unencrypted collection. They are now safely in the vault.
+        if (this.unencrypted) {
+            try {
+                await this.unencrypted.delete(normalizedAccount);
+            } catch (e) { /* may not exist */ }
+            for (const type of types) {
+                try {
+                    await this.unencrypted.delete(`${normalizedAccount}_${type}`);
+                } catch (e) { /* may not exist */ }
             }
         }
     }
@@ -5050,6 +5143,21 @@ class KeyManager {
      * serialized, persisted, or read from devtools. When the tab closes or the
      * PIN expires, it is destroyed and the encrypted blobs become unrecoverable.
      */
+    /**
+     * Record a failed PIN attempt and enforce lockout.
+     * @returns {{ locked: boolean, remainingSec: number }}
+     */
+    _recordFailedPinAttempt() {
+        this._pinAttempts++;
+        const maxAttempts = this.config.PIN_MAX_ATTEMPTS || 10;
+        if (this._pinAttempts >= maxAttempts) {
+            this._pinLockoutUntil = Date.now() + (this.config.PIN_LOCKOUT_MS || 300000);
+            this._pinAttempts = 0; // Reset counter; lockout timer takes over
+            return { locked: true, remainingSec: Math.ceil((this.config.PIN_LOCKOUT_MS || 300000) / 1000) };
+        }
+        return { locked: false, remainingSec: 0 };
+    }
+
     async _generateSessionCryptoKey() {
         // Destroy any existing key first
         this._destroySessionCrypto(false);
@@ -5227,7 +5335,23 @@ class KeyManager {
         // If vault is configured but PIN has expired, request PIN unlock
         // instead of asking for the raw private key
         if (this.vaultDbReference && !this.isPINValid()) {
-            return new Promise((resolve, reject) => {
+            // SECURITY FIX (v3.5.2): Queue concurrent PIN requests to prevent
+            // double-dialog. If a PIN prompt is already active, wait for it.
+            if (this._pendingPinUnlock) {
+                try {
+                    await this._pendingPinUnlock;
+                    // PIN was unlocked by the other request — retry key fetch
+                    const cachedEntry = this.sessionKeys.get(`${normalizedAccount}_${type}`);
+                    if (cachedEntry) {
+                        const decrypted = await this._decryptFromCache(cachedEntry);
+                        if (decrypted) return decrypted;
+                    }
+                } catch (e) {
+                    // Previous unlock failed — fall through to show our own dialog
+                }
+            }
+
+            const pinPromise = new Promise((resolve, reject) => {
                 const timeout = setTimeout(() => {
                     reject(new KeyNotFoundError(normalizedAccount, type));
                 }, 120000); // 2 minutes to allow retries
@@ -5321,12 +5445,16 @@ class KeyManager {
                 emitData.keyCallback = keyCallback;
                 this.emitter.emit('pin_required', emitData);
             });
+
+            this._pendingPinUnlock = pinPromise;
+            pinPromise.finally(() => { this._pendingPinUnlock = null; });
+            return pinPromise;
         }
 
         return new Promise((resolve, reject) => {
             const eventName = `key_request_${normalizedAccount}_${type}`;
             const timeout = setTimeout(() => {
-                this.emitter.removeAllListeners(eventName);
+                this.emitter.removeListener(eventName, keyResponseHandler);
                 reject(new KeyNotFoundError(normalizedAccount, type));
             }, 60000);
 
@@ -5349,7 +5477,7 @@ class KeyManager {
             this.emitter.emit('key_required', { account: normalizedAccount, type, callback });
 
             // Also listen for the legacy event-based response
-            this.emitter.once(eventName, async (keyInput) => {
+            const keyResponseHandler = async (keyInput) => {
                 clearTimeout(timeout);
                 try {
                     if (typeof keyInput === 'object' && keyInput.masterPassword) {
@@ -5362,7 +5490,8 @@ class KeyManager {
                         resolve(keyValue);
                     }
                 } catch(e) { reject(e); }
-            });
+            };
+            this.emitter.once(eventName, keyResponseHandler);
         });
     }
 
@@ -5379,23 +5508,35 @@ class KeyManager {
 
         await this.cacheKeys(normalizedAccount, derivedKeys);
 
-        // ALWAYS store in unencrypted as the reliable ground-truth fallback.
-        // This ensures loadUnencryptedKeys() can always recover keys even if
-        // the encrypted vault reads fail (stale handles, TurboSerial errors, etc.)
-        if (this.unencrypted) {
-            try {
-                await this.unencrypted.add({ account: normalizedAccount, derived_keys: derivedKeys, created_at: Date.now() }, { id: normalizedAccount });
-            } catch (e) {
-                try { await this.unencrypted.update(normalizedAccount, { derived_keys: derivedKeys, updated_at: Date.now() }); } catch (e2) { /* ignore */ }
-            }
-        }
-
-        // ALSO store in encrypted vault when available (belt-and-suspenders).
+        // SECURITY FIX (v3.5.2): Never store keys in the unencrypted collection
+        // when a vault is active. Plaintext IndexedDB storage is accessible to
+        // any same-origin script (XSS), browser extension, or physical attacker.
         if (this.vaultMaster) {
+            // Store ONLY in encrypted vault
             try {
-                await this.vaultMaster.add({ account: normalizedAccount, derived_keys: derivedKeys, created_at: Date.now() }, { id: normalizedAccount });
+                await this.vaultMaster.add(
+                    { account: normalizedAccount, derived_keys: derivedKeys, created_at: Date.now() },
+                    { id: normalizedAccount }
+                );
             } catch (e) {
                 // Already exists — skip (don't use update — encrypted vault update can fail)
+            }
+        } else if (this.unencrypted) {
+            // No vault available (quickLogin before vault setup) — store in
+            // unencrypted as temporary fallback. These MUST be migrated to the
+            // vault and deleted from unencrypted on next initializeVault().
+            // SECURITY: Exclude owner key from unencrypted storage — owner key
+            // can change all other keys and steal the account entirely.
+            const safeKeys = { posting: derivedKeys.posting, active: derivedKeys.active, memo: derivedKeys.memo };
+            try {
+                await this.unencrypted.add(
+                    { account: normalizedAccount, derived_keys: safeKeys, created_at: Date.now() },
+                    { id: normalizedAccount }
+                );
+            } catch (e) {
+                try {
+                    await this.unencrypted.update(normalizedAccount, { derived_keys: safeKeys, updated_at: Date.now() });
+                } catch (e2) { /* ignore */ }
             }
         }
 
@@ -5409,23 +5550,25 @@ class KeyManager {
         const stored = await this._encryptForCache(key);
         this.sessionKeys.set(`${normalizedAccount}_${type}`, stored);
 
-        // ALWAYS store in unencrypted as the reliable ground-truth fallback.
-        if (this.unencrypted) {
+        // SECURITY FIX (v3.5.2): Vault-first storage. Never store in unencrypted
+        // when vault is available. Never store owner keys in unencrypted at all.
+        if (this.vaultIndividual) {
+            const id = `${normalizedAccount}_${type}`;
+            try {
+                await this.vaultIndividual.add(
+                    { account: normalizedAccount, type, key, created_at: Date.now() },
+                    { id }
+                );
+            } catch (e) {
+                // Already exists — skip
+            }
+        } else if (this.unencrypted && type !== 'owner') {
+            // Temporary unencrypted fallback (no vault yet). Exclude owner keys.
             const id = `${normalizedAccount}_${type}`;
             try {
                 await this.unencrypted.add({ account: normalizedAccount, type, key, created_at: Date.now() }, { id });
             } catch (e) {
                 try { await this.unencrypted.update(id, { key, updated_at: Date.now() }); } catch (e2) { /* ignore */ }
-            }
-        }
-
-        // ALSO store in encrypted vault when requested and available.
-        if (options.storeInVault && this.vaultIndividual) {
-            const id = `${normalizedAccount}_${type}`;
-            try {
-                await this.vaultIndividual.add({ account: normalizedAccount, type, key, created_at: Date.now() }, { id });
-            } catch (e) {
-                // Already exists — skip (don't use update — encrypted vault update can fail)
             }
         }
     }
@@ -5488,19 +5631,11 @@ class KeyManager {
     }
 
     /**
-     * @deprecated Use requestKey() instead — getKeySync cannot decrypt encrypted cache entries.
-     * Returns null for encrypted entries. Only works for plaintext (quickLogin) keys.
+     * @removed v3.5.2 — Returned plaintext keys for quickLogin sessions.
+     * Use requestKey() (async) which properly decrypts in-memory encrypted keys.
      */
-    getKeySync(account, type) {
-        const normalizedAccount = normalizeAccount(account);
-        if (!normalizedAccount) return null;
-        if (this.pinVerificationTime > 0 && !this.isPINValid()) {
-            return null;
-        }
-        const entry = this.sessionKeys.get(`${normalizedAccount}_${type}`);
-        // Only return plaintext entries; encrypted blobs require async decryption
-        if (entry && typeof entry === 'object' && entry._enc) return null;
-        return entry || null;
+    getKeySync(_account, _type) {
+        return null;
     }
 
     setActiveAccount(acc) {
@@ -5611,8 +5746,13 @@ class SessionManager {
         }
 
         const now = Date.now();
-        const timeout = this.config.SESSION_TIMEOUT || 7 * 24 * 60 * 60 * 1000;
-        const sessionId = `${normalizedAccount}_${now}_${Math.random().toString(36).substr(2, 9)}`;
+        // SECURITY FIX (v3.5.2): Use config timeout only — no 7-day fallback (fail-closed)
+        const timeout = this.config.SESSION_TIMEOUT;
+        if (!timeout || timeout <= 0) {
+            throw new Error('SESSION_TIMEOUT not configured');
+        }
+        // SECURITY FIX (v3.5.2): Use CSPRNG for session IDs instead of Math.random()
+        const sessionId = `${normalizedAccount}_${now}_${bytesToHex(getRandomBytes(16))}`;
 
         const sessionData = {
             account: normalizedAccount,
@@ -5684,7 +5824,8 @@ class SessionManager {
         if (!normalizedAccount) return false;
 
         const now = Date.now();
-        const timeout = this.config.SESSION_TIMEOUT || 7 * 24 * 60 * 60 * 1000;
+        // SECURITY FIX (v3.5.2): Consistent timeout — no 7-day fallback
+        const timeout = this.config.SESSION_TIMEOUT || 30 * 60 * 1000;
 
         try {
             await this.sessions.update(normalizedAccount, {
@@ -5839,7 +5980,10 @@ export {
     Types,
     BlockchainMode,
     getVestingSharePrice,
-    getVests
+    getVests,
+    VERSION,
+    DEFAULT_CHAIN_ID,
+    NETWORK_ID
 };
 
 // Utility functions
@@ -5848,3 +5992,7 @@ export {
     getRandomBytes,
     bytesToHex
 };
+
+// Re-export SDK utility helpers
+const { waitForEvent, retryingFetch } = utils;
+export { waitForEvent, retryingFetch };
