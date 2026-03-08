@@ -1,89 +1,7 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.5.1
- *
- * Changes in 3.5.1:
- * - BUGFIX: deleteComment() now uses sendOperations() instead of non-existent
- *   broadcast.deleteComment() convenience method (was a runtime crash)
- * - claimRewardBalance() now uses SDK convenience method broadcast.claimRewardBalance()
- * - getKeyReferences() now uses typed client.keys.getKeyReferences() instead of raw call
- * - RC mana fallbacks delegate to client.rc.calculateRCMana()/calculateVPMana()
- *   instead of manual BigInt math
- * - Added missing re-exports: VERSION, DEFAULT_CHAIN_ID, NETWORK_ID
- * - Added missing utility re-exports: waitForEvent, retryingFetch (from utils)
- * - Renamed vestToSteem()/steemToVest() → vestToPixa()/pixaToVest()
- *   (legacy names kept as deprecated aliases)
- *
- * Changes in 3.5.0:
- * - DANGEROUS FIELD SANITIZATION: `body`, `json_metadata`, `posting_json_metadata`
- *   are parsed/sanitized at ingestion; only the safe output is persisted.
- *   - `body` now contains sanitized HTML (not raw markdown). No `html`, `sanitizedBody`.
- *   - `json_metadata` / `posting_json_metadata` keep their original field names but store
- *     the WASM-parsed safe object (not the raw JSON string).
- * - All ISO-8601 date fields are stored as integer millisecond timestamps
- *   (direct `new Date(ts)` usage, efficient indexing and comparison).
- * - Enrichment fields use underscore-prefixed keys at document root:
- *   - Posts:    `_images`, `_links`, `_summary`, `_tags`, `_word_count`, `_app`
- *   - Comments: `_images`, `_links`, `_word_count`
- *   - Accounts: `_profile` (display_name, about, location, website, images), `_links`
- * - Entity store collections have named indexes for efficient queries:
- *   `accounts_store`, `posts_store`, `comments_store`, `query_cache`
- * - Added missing API fields: authority objects (`owner`/`active`/`posting`),
- *   `downvote_manabar`, power-down state, `cashout_time`, `active_votes`,
- *   `allow_replies`, `root_author`/`root_permlink`, governance, and more.
- * - Legacy fallbacks in formatAccount, processPost, processComment no longer use
- *   `{ ...raw }` spread — all paths build entities field-by-field.
- * - Removed redundant fields: `sanitizedBody`, `html`, `plainText`, `wordCount`,
- *   `images`, `links`, `tags`, `app`, `parsed_metadata`, `sanitized_*`, `display_name`
- *
- * Changes in 3.4.0:
- * - Introduced entity-based storage architecture with separate DB stores:
- *   - accounts_store: indexed by username and numeric ID
- *   - posts_store: indexed by `${author}_${permlink}` for root posts (depth=0)
- *   - comments_store: indexed by `${author}_${permlink}` for comments/replies (depth>0)
- * - All entities are sanitized before DB insertion via SanitizationPipeline:
- *   - Posts: renderPost → html, images, links, wordCount; metadata parsed
- *   - Comments: renderComment → html, images, links (stricter subset)
- *   - Accounts: safeJson on json_metadata, sanitizeUsername
- * - Added QueryCacheManager: query results stored as ID arrays only (relational)
- *   - Fresh queries resolve IDs from entity stores without re-fetching
- *   - Stale queries re-fetch, sanitize, upsert entities, then cache ID list
- * - EntityStoreManager provides typed get/upsert/resolve operations per entity type
- * - Existing CacheManager retained for non-entity caches (blocks, globals, market, etc.)
- *
- * Changes in 3.3.0:
- * - Replaced naive regex ContentSanitizer with pixa-content WASM engine
- * - Full whitelist-based HTML sanitization via ammonia (XSS protection)
- * - Added processComment() for comment-specific rendering (restricted subset)
- * - Added extractPlainText() for clean text extraction
- * - Added summarizeContent() for TF-IDF extractive summarization
- * - Added safeJson() as single entry point for all JSON metadata sanitization
- * - Added sanitizeUsername() helper
- * - processPost() now returns full RenderResult (html, images, links) from WASM
- * - @mention and #hashtag linking handled natively by pixa-content
- * - External link isolation with data-* attributes for React dialogs
- * - Base64 image validation and SVG script detection
- * - Configurable internal domains and image limits via renderOptions
- *
- * Changes in 3.2.0:
- * - Fixed session management (expiration checks, consistent return types)
- * - Added missing broadcast methods (claimRewardBalance, transferToVesting, etc.)
- * - Added AccountByKeyAPI (client.keys)
- * - Added complete blockchain streaming API
- * - Added RC mana helpers (getRCMana, getVPMana)
- * - Added Transaction Status API
- * - Fixed browser compatibility (removed Node.js crypto dependency)
- * - Added utility re-exports (Asset, Price, Memo, etc.)
- * - Fixed comment() double-stringify issue
- * - Improved error handling throughout
- *
- * Changes in 3.1.0:
- * - Removed socialClient - all calls now use single unified client
- * - Removed bridge API calls - using database.getDiscussions() and direct API calls
- * - Simplified client initialization
- * - Maintained full API compatibility
- * - Uses @pixagram/dpixa Client API exclusively
+ * @version 3.6.0
  *
  * API Groups and Methods:
  *
@@ -359,7 +277,7 @@ const CONFIG = {
     },
     SESSION_TIMEOUT: 30 * 60 * 1000,
     PIN_TIMEOUT: 5 * 60 * 1000,
-    MIN_PIN_LENGTH: 8,
+    MIN_PIN_LENGTH: 6,
     PIN_MAX_ATTEMPTS: 10,
     PIN_LOCKOUT_MS: 5 * 60 * 1000,
     DEFAULT_NODES: [
@@ -599,8 +517,9 @@ async function pbkdf2Derive(password, salt, iterations, keyLength) {
  */
 function normalizeAccount(account) {
     if (!account) return null;
-    if (typeof account === 'string') return account.toLowerCase().trim();
-    return (account?.account || account?.name || '').toLowerCase().trim() || null;
+    if (typeof account === 'string') return account.replace(/^@/, '').toLowerCase().trim() || null;
+    const raw = account?.account || account?.name || '';
+    return raw.replace(/^@/, '').toLowerCase().trim() || null;
 }
 
 // ============================================
@@ -764,13 +683,23 @@ export class PixaProxyAPI {
             /** @type {boolean} Whether the WASM sanitizer is operational */
             this.sanitizerReady = this.contentSanitizer.ready;
 
-            // Initialize entity-based storage (v3.4.0)
-            this.sanitizationPipeline = new SanitizationPipeline(this.contentSanitizer, this.formatter);
-            this.entityStore = new EntityStoreManager(this.cacheDb, this.sanitizationPipeline, this.config.ENTITY_TTL);
-            this.queryCache = new QueryCacheManager(this.cacheDb, this.config.QUERY_TTL);
+            // SECURITY PATCH (v3.5.2-patched): Only create entity pipeline when
+            // WASM sanitizer is operational. If WASM failed and allowDegradedSanitizer
+            // was set, pipeline stays null — API fallback paths will refuse to serve
+            // raw data (fail-closed).
+            if (this.sanitizerReady) {
+                this.sanitizationPipeline = new SanitizationPipeline(this.contentSanitizer, this.formatter);
+                this.entityStore = new EntityStoreManager(this.cacheDb, this.sanitizationPipeline, this.config.ENTITY_TTL);
+                this.queryCache = new QueryCacheManager(this.cacheDb, this.config.QUERY_TTL);
+            } else {
+                this.sanitizationPipeline = null;
+                this.entityStore = null;
+                this.queryCache = null;
+                console.warn('[PixaProxyAPI] Entity pipeline DISABLED — WASM sanitizer not ready');
+            }
 
             this.initialized = true;
-            console.log('[PixaProxyAPI] Initialized successfully v3.5.2');
+            console.log('[PixaProxyAPI] Initialized successfully v3.5.2-patched');
             return this;
         } catch (error) {
             console.error('[PixaProxyAPI] Initialization failed:', error);
@@ -1496,7 +1425,12 @@ export class PixaProxyAPI {
     formatAccount(account) {
         if (!account) return null;
 
-        // v3.5.2: Re-validate _sanitized flag (same as processPost)
+        // SECURITY PATCH (v3.5.2-patched): Require sanitizer — fail-closed
+        if (!this.sanitizerReady) {
+            throw new PixaAPIError('Cannot format account: content sanitizer not ready', 'SANITIZER_NOT_READY');
+        }
+
+        // v3.5.2: Re-validate _sanitized flag
         if (account._sanitized && account._entity_type === 'account' && account._stored_at &&
             (Date.now() - account._stored_at) < (this.config.ENTITY_TTL?.accounts || 300000)) {
             return account;
@@ -1556,9 +1490,13 @@ export class PixaProxyAPI {
      */
     processPost(post, renderOptions = {}) {
         if (!post) return null;
+
+        // SECURITY PATCH (v3.5.2-patched): Require sanitizer — fail-closed
+        if (!this.sanitizerReady) {
+            throw new PixaAPIError('Cannot process post: content sanitizer not ready', 'SANITIZER_NOT_READY');
+        }
+
         // v3.5.2: Re-validate _sanitized flag — IndexedDB data can be tampered
-        // by devtools, XSS, or browser extensions. Only trust if _stored_at is
-        // recent (within entity TTL) and _entity_type matches.
         if (post._sanitized && post._entity_type === 'post' && post._stored_at &&
             (Date.now() - post._stored_at) < (this.config.ENTITY_TTL?.posts || 300000)) {
             return post;
@@ -1617,7 +1555,13 @@ export class PixaProxyAPI {
      */
     processComment(comment, renderOptions = {}) {
         if (!comment) return null;
-        // v3.5.2: Re-validate _sanitized flag (same as processPost)
+
+        // SECURITY PATCH (v3.5.2-patched): Require sanitizer — fail-closed
+        if (!this.sanitizerReady) {
+            throw new PixaAPIError('Cannot process comment: content sanitizer not ready', 'SANITIZER_NOT_READY');
+        }
+
+        // v3.5.2: Re-validate _sanitized flag
         if (comment._sanitized && comment._entity_type === 'comment' && comment._stored_at &&
             (Date.now() - comment._stored_at) < (this.config.ENTITY_TTL?.comments || 300000)) {
             return comment;
@@ -1767,7 +1711,7 @@ class DatabaseAPI {
     constructor(proxy) { this.proxy = proxy; }
 
     async call(method, params = []) {
-        return this.proxy.client.database.call(method, params);
+        return this.proxy.client.call('condenser_api', method, params);
     }
 
     async getDatabaseInfo() {
@@ -1792,10 +1736,10 @@ class TagsAPI {
     async _fetchDiscussions(sort, query) {
         const q = {
             tag: query.tag || '',
-            limit: query.limit || 20,
-            start_author: query.start_author || '',
-            start_permlink: query.start_permlink || ''
+            limit: parseInt(query.limit, 10) || 20
         };
+        if (query.start_author) q.start_author = query.start_author;
+        if (query.start_permlink) q.start_permlink = query.start_permlink;
 
         const queryKey = QueryCacheManager.buildKey(sort, q);
 
@@ -1810,36 +1754,12 @@ class TagsAPI {
             }
         }
 
-        // Fetch from chain (try multiple fallback strategies)
         let rawResults = null;
 
-        // Strategy 1: condenser_api
         try {
-            rawResults = await this.proxy.client.call('condenser_api', `get_discussions_by_${sort}`, [q]);
+            rawResults = await this.proxy.client.database.getDiscussions(sort, q);
         } catch (e) {
-            console.warn(`[TagsAPI] condenser_api.get_discussions_by_${sort} failed:`, e.message);
-        }
-
-        // Strategy 2: database.getDiscussions
-        if (!rawResults) {
-            try {
-                rawResults = await this.proxy.client.database.getDiscussions(sort, q);
-            } catch (e) {
-                console.warn(`[TagsAPI] database.getDiscussions (${sort}) failed:`, e.message);
-            }
-        }
-
-        // Strategy 3: pixamind
-        if (!rawResults) {
-            try {
-                if (this.proxy.client.pixamind) {
-                    rawResults = await this.proxy.client.pixamind.getRankedPosts({
-                        sort, tag: q.tag, limit: q.limit
-                    });
-                }
-            } catch (e) {
-                console.warn(`[TagsAPI] pixamind.getRankedPosts (${sort}) failed:`, e.message);
-            }
+            console.warn(`[TagsAPI] getDiscussions(${sort}) failed:`, e.message);
         }
 
         if (!rawResults || !Array.isArray(rawResults)) return [];
@@ -1862,12 +1782,14 @@ class TagsAPI {
             return resolved.filter(Boolean);
         }
 
-        return rawResults;
+        // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED — never return raw unsanitized data
+        console.error('[TagsAPI] Sanitizer pipeline not available — refusing to serve raw content');
+        return [];
     }
 
     async getTrendingTags(afterTag = '', limit = 100) {
         try {
-            return await this.proxy.client.database.call('get_trending_tags', [afterTag, limit]);
+            return await this.proxy.client.call('condenser_api', 'get_trending_tags', [afterTag, limit]);
         } catch (e) {
             console.warn('[TagsAPI] get_trending_tags failed:', e.message);
         }
@@ -1948,7 +1870,7 @@ class GlobalsAPI {
     }
 
     async getFeedHistory() {
-        return this.proxy.client.database.call('get_feed_history');
+        return this.proxy.client.call('condenser_api', 'get_feed_history');
     }
 
     async getCurrentMedianHistoryPrice() {
@@ -1956,11 +1878,11 @@ class GlobalsAPI {
     }
 
     async getHardforkVersion() {
-        return this.proxy.client.database.call('get_hardfork_version');
+        return this.proxy.client.call('condenser_api', 'get_hardfork_version');
     }
 
     async getRewardFund(name = 'post') {
-        return this.proxy.client.database.call('get_reward_fund', [name]);
+        return this.proxy.client.call('condenser_api', 'get_reward_fund', [name]);
     }
 
     async getVestingDelegations(account, from = '', limit = 100) {
@@ -1997,18 +1919,13 @@ class AccountsAPI {
             }
         }
 
-        // Fetch from chain
+        // database.getAccounts(usernames) — documented dpixa method
         let rawAccounts = [];
         try {
             rawAccounts = await this.proxy.client.database.getAccounts(normalizedAccounts);
         } catch (e) {
-            console.warn('[AccountsAPI] database.getAccounts failed:', e.message);
-            try {
-                rawAccounts = await this.proxy.client.call('condenser_api', 'get_accounts', [normalizedAccounts]);
-            } catch (e2) {
-                console.warn('[AccountsAPI] condenser_api.get_accounts failed:', e2.message);
-                return [];
-            }
+            console.warn('[AccountsAPI] getAccounts failed:', e.message);
+            return [];
         }
 
         // Sanitize and upsert into entity store
@@ -2025,12 +1942,14 @@ class AccountsAPI {
             return sanitized;
         }
 
-        return rawAccounts;
+        // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED — never return raw unsanitized data
+        console.error('[AccountsAPI] Sanitizer pipeline not available — refusing to serve raw accounts');
+        return [];
     }
 
     async lookupAccounts(lowerBound, limit = 10) {
         try {
-            return await this.proxy.client.database.call('lookup_accounts', [lowerBound, limit]);
+            return await this.proxy.client.call('condenser_api', 'lookup_accounts', [lowerBound, limit]);
         } catch (e) {
             console.warn('[AccountsAPI] lookup_accounts failed:', e.message);
         }
@@ -2039,7 +1958,7 @@ class AccountsAPI {
 
     async lookupAccountNames(accounts) {
         try {
-            return await this.proxy.client.database.call('lookup_account_names', [accounts]);
+            return await this.proxy.client.call('condenser_api', 'lookup_account_names', [accounts]);
         } catch (e) {
             console.warn('[AccountsAPI] lookup_account_names failed:', e.message);
         }
@@ -2048,7 +1967,7 @@ class AccountsAPI {
 
     async getAccountCount() {
         try {
-            return await this.proxy.client.database.call('get_account_count');
+            return await this.proxy.client.call('condenser_api', 'get_account_count');
         } catch (e) {
             console.warn('[AccountsAPI] get_account_count failed:', e.message);
         }
@@ -2058,25 +1977,30 @@ class AccountsAPI {
     async getAccountHistory(account, from = -1, limit = 100, operationBitmask = null) {
         const normalizedAccount = normalizeAccount(account);
 
+        // HIVE API constraint: start must be >= limit - 1 (start is a reverse index).
+        // Use -1 to request the most recent entries. For explicit indices,
+        // clamp limit so the constraint is satisfied.
+        let safeFrom = from;
+        let safeLimit = limit;
+        if (safeFrom !== -1 && safeFrom < safeLimit - 1) {
+            safeLimit = safeFrom + 1;  // request only as many entries as available from that index
+        }
+
+        // database.getAccountHistory(account, from, limit, bitmask?) — documented dpixa method
         try {
             if (operationBitmask) {
-                return await this.proxy.client.database.getAccountHistory(normalizedAccount, from, limit, operationBitmask);
+                return await this.proxy.client.database.getAccountHistory(normalizedAccount, safeFrom, safeLimit, operationBitmask);
             }
-            return await this.proxy.client.database.getAccountHistory(normalizedAccount, from, limit);
+            return await this.proxy.client.database.getAccountHistory(normalizedAccount, safeFrom, safeLimit);
         } catch (e) {
-            console.warn('[AccountsAPI] database.getAccountHistory failed:', e.message);
-            try {
-                return await this.proxy.client.call('condenser_api', 'get_account_history', [normalizedAccount, from, limit]);
-            } catch (e2) {
-                console.warn('[AccountsAPI] condenser_api.get_account_history failed:', e2.message);
-            }
+            console.warn('[AccountsAPI] getAccountHistory failed:', e.message);
         }
         return [];
     }
 
     async getAccountReputations(lowerBound = '', limit = 1000) {
         try {
-            return await this.proxy.client.database.call('get_account_reputations', [lowerBound, limit]);
+            return await this.proxy.client.call('condenser_api', 'get_account_reputations', [lowerBound, limit]);
         } catch (e) {
             console.warn('[AccountsAPI] get_account_reputations failed:', e.message);
         }
@@ -2108,28 +2032,28 @@ class MarketAPI {
     constructor(proxy) { this.proxy = proxy; }
 
     async getOrderBook(limit = 500) {
-        return this.proxy.client.database.call('get_order_book', [limit]);
+        return this.proxy.client.call('condenser_api', 'get_order_book', [limit]);
     }
 
     async getOpenOrders(account) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_open_orders', [normalizedAccount]);
+        return this.proxy.client.call('condenser_api', 'get_open_orders', [normalizedAccount]);
     }
 
     async getTicker() {
-        return this.proxy.client.database.call('get_ticker');
+        return this.proxy.client.call('condenser_api', 'get_ticker');
     }
 
     async getTradeHistory(start, end, limit = 1000) {
-        return this.proxy.client.database.call('get_trade_history', [start, end, limit]);
+        return this.proxy.client.call('condenser_api', 'get_trade_history', [start, end, limit]);
     }
 
     async getMarketHistory(bucketSeconds, start, end) {
-        return this.proxy.client.database.call('get_market_history', [bucketSeconds, start, end]);
+        return this.proxy.client.call('condenser_api', 'get_market_history', [bucketSeconds, start, end]);
     }
 
     async getMarketHistoryBuckets() {
-        return this.proxy.client.database.call('get_market_history_buckets');
+        return this.proxy.client.call('condenser_api', 'get_market_history_buckets');
     }
 }
 
@@ -2142,32 +2066,32 @@ class AuthorityAPI {
 
     async getOwnerHistory(account) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_owner_history', [normalizedAccount]);
+        return this.proxy.client.call('condenser_api', 'get_owner_history', [normalizedAccount]);
     }
 
     async getRecoveryRequest(account) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_recovery_request', [normalizedAccount]);
+        return this.proxy.client.call('condenser_api', 'get_recovery_request', [normalizedAccount]);
     }
 
     async getWithdrawRoutes(account, type = 'outgoing') {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_withdraw_routes', [normalizedAccount, type]);
+        return this.proxy.client.call('condenser_api', 'get_withdraw_routes', [normalizedAccount, type]);
     }
 
     async getAccountBandwidth(account, type) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_account_bandwidth', [normalizedAccount, type]);
+        return this.proxy.client.call('condenser_api', 'get_account_bandwidth', [normalizedAccount, type]);
     }
 
     async getSavingsWithdrawFrom(account) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_savings_withdraw_from', [normalizedAccount]);
+        return this.proxy.client.call('condenser_api', 'get_savings_withdraw_from', [normalizedAccount]);
     }
 
     async getSavingsWithdrawTo(account) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_savings_withdraw_to', [normalizedAccount]);
+        return this.proxy.client.call('condenser_api', 'get_savings_withdraw_to', [normalizedAccount]);
     }
 
     async verifyAuthority(stx) {
@@ -2184,12 +2108,12 @@ class VotesAPI {
 
     async getActiveVotes(author, permlink) {
         const normalizedAuthor = normalizeAccount(author);
-        return this.proxy.client.database.call('get_active_votes', [normalizedAuthor, permlink]);
+        return this.proxy.client.call('condenser_api', 'get_active_votes', [normalizedAuthor, permlink]);
     }
 
     async getAccountVotes(account) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_account_votes', [normalizedAccount]);
+        return this.proxy.client.call('condenser_api', 'get_account_votes', [normalizedAccount]);
     }
 }
 
@@ -2216,7 +2140,7 @@ class ContentAPI {
         // Fetch from chain
         let raw = null;
         try {
-            raw = await this.proxy.client.database.call('get_content', [normalizedAuthor, permlink]);
+            raw = await this.proxy.client.call('condenser_api', 'get_content', [normalizedAuthor, permlink]);
         } catch (e) {
             console.warn('[ContentAPI] get_content failed:', e.message);
             return null;
@@ -2234,7 +2158,9 @@ class ContentAPI {
             }
         }
 
-        return raw;
+        // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED
+        console.error('[ContentAPI] Sanitizer pipeline not available — refusing to serve raw content');
+        return null;
     }
 
     async getContentReplies(author, permlink) {
@@ -2254,7 +2180,7 @@ class ContentAPI {
         // Fetch from chain
         let rawReplies = [];
         try {
-            rawReplies = await this.proxy.client.database.call('get_content_replies', [normalizedAuthor, permlink]);
+            rawReplies = await this.proxy.client.call('condenser_api', 'get_content_replies', [normalizedAuthor, permlink]);
         } catch (e) {
             console.warn('[ContentAPI] get_content_replies failed:', e.message);
             return [];
@@ -2276,13 +2202,15 @@ class ContentAPI {
             return (await this.proxy.entityStore.resolve('comments', ids)).filter(Boolean);
         }
 
-        return rawReplies;
+        // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED
+        console.error('[ContentAPI] Sanitizer pipeline not available — refusing to serve raw replies');
+        return [];
     }
 
     async getDiscussionsByAuthorBeforeDate(author, startPermlink, beforeDate, limit = 10) {
         const normalizedAuthor = normalizeAccount(author);
         try {
-            const rawResults = await this.proxy.client.database.call('get_discussions_by_author_before_date', [normalizedAuthor, startPermlink, beforeDate, limit]);
+            const rawResults = await this.proxy.client.call('condenser_api', 'get_discussions_by_author_before_date', [normalizedAuthor, startPermlink, beforeDate, limit]);
 
             // Sanitize and store
             if (rawResults && this.proxy.sanitizationPipeline && this.proxy.entityStore) {
@@ -2297,17 +2225,28 @@ class ContentAPI {
                 }
                 return sanitized;
             }
-            return rawResults || [];
+            // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED
+            if (rawResults && rawResults.length > 0) {
+                console.error('[ContentAPI] Sanitizer pipeline not available — refusing raw content');
+            }
+            return [];
         } catch (e) {
             console.warn('[ContentAPI] get_discussions_by_author_before_date failed:', e.message);
         }
         return [];
     }
 
-    async getRepliesByLastUpdate(author, startPermlink, limit = 10) {
+    async getRepliesByLastUpdate(author, startPermlink = '', limit = 10) {
         const normalizedAuthor = normalizeAccount(author);
+        if (!normalizedAuthor) return [];
+
         try {
-            const rawResults = await this.proxy.client.database.call('get_replies_by_last_update', [normalizedAuthor, startPermlink, limit]);
+            // get_discussions_by_comments uses start_author, not tag
+            const q = { start_author: normalizedAuthor, limit };
+            if (startPermlink) {
+                q.start_permlink = startPermlink;
+            }
+            const rawResults = await this.proxy.client.database.getDiscussions('comments', q);
 
             // Sanitize and store as comments
             if (rawResults && this.proxy.sanitizationPipeline && this.proxy.entityStore) {
@@ -2321,9 +2260,13 @@ class ContentAPI {
                 }
                 return sanitized;
             }
-            return rawResults || [];
+            // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED
+            if (rawResults && rawResults.length > 0) {
+                console.error('[ContentAPI] Sanitizer pipeline not available — refusing raw replies');
+            }
+            return [];
         } catch (e) {
-            console.warn('[ContentAPI] get_replies_by_last_update failed:', e.message);
+            console.warn('[ContentAPI] getRepliesByLastUpdate failed:', e.message);
         }
         return [];
     }
@@ -2337,12 +2280,20 @@ class ContentAPI {
         const normalizedTag = normalizeAccount(query.tag || '');
         if (!normalizedTag) return [];
 
-        const q = {
-            tag: normalizedTag,
-            limit: query.limit || 20,
-            start_author: query.start_author || '',
-            start_permlink: query.start_permlink || ''
-        };
+        const limit = parseInt(query.limit, 10) || 20;
+
+        // dpixa passes the query object through to condenser_api.get_discussions_by_${sort}
+        // get_discussions_by_comments does NOT accept "tag" — it uses start_author
+        // get_discussions_by_blog / get_discussions_by_feed use "tag" as the username
+        const q = { limit };
+        if (sort === 'comments') {
+            q.start_author = normalizedTag;
+            if (query.start_permlink) q.start_permlink = query.start_permlink;
+        } else {
+            q.tag = normalizedTag;
+            if (query.start_author) q.start_author = query.start_author;
+            if (query.start_permlink) q.start_permlink = query.start_permlink;
+        }
 
         const queryKey = QueryCacheManager.buildKey(`content_${sort}`, q);
 
@@ -2358,35 +2309,10 @@ class ContentAPI {
         // Fetch from chain
         let rawResults = null;
 
-        // Strategy 1: condenser_api
-        const condenserMethod = `get_discussions_by_${sort}`;
         try {
-            rawResults = await this.proxy.client.call('condenser_api', condenserMethod, [q]);
+            rawResults = await this.proxy.client.database.getDiscussions(sort, q);
         } catch (e) {
-            console.warn(`[ContentAPI] condenser_api.${condenserMethod} failed:`, e.message);
-        }
-
-        // Strategy 2: database.getDiscussions
-        if (!rawResults) {
-            try {
-                rawResults = await this.proxy.client.database.getDiscussions(sort, q);
-            } catch (e) {
-                console.warn(`[ContentAPI] database.getDiscussions (${sort}) failed:`, e.message);
-            }
-        }
-
-        // Strategy 3: pixamind
-        if (!rawResults && this.proxy.client.pixamind) {
-            try {
-                const pixamindSort = sort === 'comments' ? 'comments' : sort;
-                rawResults = await this.proxy.client.pixamind.getAccountPosts({
-                    account: normalizedTag,
-                    sort: pixamindSort,
-                    limit: q.limit
-                });
-            } catch (e) {
-                console.warn(`[ContentAPI] pixamind.getAccountPosts (${sort}) failed:`, e.message);
-            }
+            console.warn(`[ContentAPI] getDiscussions(${sort}) failed:`, e.message);
         }
 
         if (!rawResults || !Array.isArray(rawResults)) return [];
@@ -2407,7 +2333,9 @@ class ContentAPI {
             return resolved.filter(Boolean);
         }
 
-        return rawResults;
+        // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED
+        console.error('[ContentAPI] Sanitizer pipeline not available — refusing to serve raw content');
+        return [];
     }
 
     async getDiscussionsByComments(query) {
@@ -2415,12 +2343,15 @@ class ContentAPI {
         const normalizedAuthor = normalizeAccount(author);
         if (!normalizedAuthor) return [];
 
-        return this._fetchDiscussionsWithCache('comments', {
+        const q = {
             tag: normalizedAuthor,
-            limit: query.limit || 20,
-            start_author: query.start_author || normalizedAuthor,
-            start_permlink: query.start_permlink || ''
-        }, 'comments');
+            limit: parseInt(query.limit, 10) || 20
+        };
+        // Only include pagination cursor if both fields are present
+        if (query.start_author) q.start_author = query.start_author;
+        if (query.start_permlink) q.start_permlink = query.start_permlink;
+
+        return this._fetchDiscussionsWithCache('comments', q, 'comments');
     }
 
     async getDiscussionsByBlog(query) {
@@ -2435,12 +2366,14 @@ class ContentAPI {
         const normalizedAccount = normalizeAccount(account);
         if (!normalizedAccount) return [];
 
-        return this._fetchDiscussionsWithCache(sort, {
+        const q = {
             tag: normalizedAccount,
-            limit,
-            start_author: options.start_author || '',
-            start_permlink: options.start_permlink || ''
-        }, sort === 'comments' ? 'comments' : 'posts');
+            limit: parseInt(limit, 10) || 20
+        };
+        if (options.start_author) q.start_author = options.start_author;
+        if (options.start_permlink) q.start_permlink = options.start_permlink;
+
+        return this._fetchDiscussionsWithCache(sort, q, sort === 'comments' ? 'comments' : 'posts');
     }
 
     async getState(path) {
@@ -2457,27 +2390,27 @@ class WitnessesAPI {
 
     async getWitnessByAccount(account) {
         const normalizedAccount = normalizeAccount(account);
-        return this.proxy.client.database.call('get_witness_by_account', [normalizedAccount]);
+        return this.proxy.client.call('condenser_api', 'get_witness_by_account', [normalizedAccount]);
     }
 
     async getWitnessesByVote(from, limit = 100) {
-        return this.proxy.client.database.call('get_witnesses_by_vote', [from, limit]);
+        return this.proxy.client.call('condenser_api', 'get_witnesses_by_vote', [from, limit]);
     }
 
     async lookupWitnessAccounts(lowerBound, limit = 100) {
-        return this.proxy.client.database.call('lookup_witness_accounts', [lowerBound, limit]);
+        return this.proxy.client.call('condenser_api', 'lookup_witness_accounts', [lowerBound, limit]);
     }
 
     async getWitnessCount() {
-        return this.proxy.client.database.call('get_witness_count');
+        return this.proxy.client.call('condenser_api', 'get_witness_count');
     }
 
     async getActiveWitnesses() {
-        return this.proxy.client.database.call('get_active_witnesses');
+        return this.proxy.client.call('condenser_api', 'get_active_witnesses');
     }
 
     async getWitnessSchedule() {
-        return this.proxy.client.database.call('get_witness_schedule');
+        return this.proxy.client.call('condenser_api', 'get_witness_schedule');
     }
 }
 
@@ -2488,93 +2421,50 @@ class WitnessesAPI {
 class FollowAPI {
     constructor(proxy) { this.proxy = proxy; }
 
-    async getFollowers(account, startFollower = '', type = 'blog', limit = 100) {
+    async getFollowers(account, startFollower = null, type = 'blog', limit = 100) {
         const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return [];
+        const safeLimit = parseInt(limit, 10) || 100;
 
-        // Try follow_api first
         try {
-            return await this.proxy.client.call('follow_api', 'get_followers', [normalizedAccount, startFollower, type, limit]);
+            return await this.proxy.client.call('condenser_api', 'get_followers', [normalizedAccount, startFollower, type, safeLimit]);
         } catch (e) {
-            console.warn('[FollowAPI] follow_api.get_followers failed:', e.message);
+            console.warn('[FollowAPI] get_followers failed:', e.message);
         }
-
-        // Try condenser_api
-        try {
-            return await this.proxy.client.call('condenser_api', 'get_followers', [normalizedAccount, startFollower, type, limit]);
-        } catch (e) {
-            console.warn('[FollowAPI] condenser_api.get_followers failed:', e.message);
-        }
-
-        // Try database_api (some nodes have this)
-        try {
-            return await this.proxy.client.database.call('get_followers', [normalizedAccount, startFollower, type, limit]);
-        } catch (e) {
-            console.warn('[FollowAPI] database_api.get_followers failed:', e.message);
-        }
-
         return [];
     }
 
-    async getFollowing(account, startFollowing = '', type = 'blog', limit = 100) {
+    async getFollowing(account, startFollowing = null, type = 'blog', limit = 100) {
         const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return [];
+        const safeLimit = parseInt(limit, 10) || 100;
 
-        // Try follow_api first
         try {
-            return await this.proxy.client.call('follow_api', 'get_following', [normalizedAccount, startFollowing, type, limit]);
+            return await this.proxy.client.call('condenser_api', 'get_following', [normalizedAccount, startFollowing, type, safeLimit]);
         } catch (e) {
-            console.warn('[FollowAPI] follow_api.get_following failed:', e.message);
+            console.warn('[FollowAPI] get_following failed:', e.message);
         }
-
-        // Try condenser_api
-        try {
-            return await this.proxy.client.call('condenser_api', 'get_following', [normalizedAccount, startFollowing, type, limit]);
-        } catch (e) {
-            console.warn('[FollowAPI] condenser_api.get_following failed:', e.message);
-        }
-
-        // Try database_api (some nodes have this)
-        try {
-            return await this.proxy.client.database.call('get_following', [normalizedAccount, startFollowing, type, limit]);
-        } catch (e) {
-            console.warn('[FollowAPI] database_api.get_following failed:', e.message);
-        }
-
         return [];
     }
 
     async getFollowCount(account) {
         const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return { account: account || '', follower_count: 0, following_count: 0 };
 
-        // Try follow_api first
-        try {
-            return await this.proxy.client.call('follow_api', 'get_follow_count', [normalizedAccount]);
-        } catch (e) {
-            console.warn('[FollowAPI] follow_api.get_follow_count failed:', e.message);
-        }
-
-        // Try condenser_api
-        try {
-            return await this.proxy.client.call('condenser_api', 'get_follow_count', [normalizedAccount]);
-        } catch (e) {
-            console.warn('[FollowAPI] condenser_api.get_follow_count failed:', e.message);
-        }
-
-        // Fallback: Get counts from account data (works without hivemind)
+        // database.getAccounts(usernames) — documented dpixa method, always has follower counts
         try {
             const accounts = await this.proxy.client.database.getAccounts([normalizedAccount]);
             if (accounts && accounts[0]) {
                 const acc = accounts[0];
-                // These fields exist in the raw account data
                 return {
                     account: normalizedAccount,
-                    follower_count: acc.follower_count || acc.followers_count || 0,
-                    following_count: acc.following_count || acc.followings_count || 0
+                    follower_count: acc.follower_count || 0,
+                    following_count: acc.following_count || 0
                 };
             }
         } catch (e) {
-            console.warn('[FollowAPI] account data fallback failed:', e.message);
+            console.warn('[FollowAPI] getFollowCount failed:', e.message);
         }
-
         return { account: normalizedAccount, follower_count: 0, following_count: 0 };
     }
 
@@ -2582,9 +2472,9 @@ class FollowAPI {
         const normalizedAccount = normalizeAccount(account);
 
         try {
-            return await this.proxy.client.call('follow_api', 'get_feed_entries', [normalizedAccount, startEntryId, limit]);
+            return await this.proxy.client.call('condenser_api', 'get_feed_entries', [normalizedAccount, startEntryId, limit]);
         } catch (e) {
-            console.warn('[FollowAPI] follow_api.get_feed_entries failed:', e.message);
+            console.warn('[FollowAPI] get_feed_entries failed:', e.message);
         }
         return [];
     }
@@ -2593,9 +2483,9 @@ class FollowAPI {
         const normalizedAccount = normalizeAccount(account);
 
         try {
-            return await this.proxy.client.call('follow_api', 'get_blog_entries', [normalizedAccount, startEntryId, limit]);
+            return await this.proxy.client.call('condenser_api', 'get_blog_entries', [normalizedAccount, startEntryId, limit]);
         } catch (e) {
-            console.warn('[FollowAPI] follow_api.get_blog_entries failed:', e.message);
+            console.warn('[FollowAPI] get_blog_entries failed:', e.message);
         }
         return [];
     }
@@ -2604,9 +2494,9 @@ class FollowAPI {
         const normalizedAuthor = normalizeAccount(author);
 
         try {
-            return await this.proxy.client.call('follow_api', 'get_reblogged_by', [normalizedAuthor, permlink]);
+            return await this.proxy.client.call('condenser_api', 'get_reblogged_by', [normalizedAuthor, permlink]);
         } catch (e) {
-            console.warn('[FollowAPI] follow_api.get_reblogged_by failed:', e.message);
+            console.warn('[FollowAPI] get_reblogged_by failed:', e.message);
         }
         return [];
     }
@@ -2615,9 +2505,9 @@ class FollowAPI {
         const normalizedAccount = normalizeAccount(account);
 
         try {
-            return await this.proxy.client.call('follow_api', 'get_blog_authors', [normalizedAccount]);
+            return await this.proxy.client.call('condenser_api', 'get_blog_authors', [normalizedAccount]);
         } catch (e) {
-            console.warn('[FollowAPI] follow_api.get_blog_authors failed:', e.message);
+            console.warn('[FollowAPI] get_blog_authors failed:', e.message);
         }
         return [];
     }
@@ -2625,12 +2515,11 @@ class FollowAPI {
     async getSubscriptions(account) {
         const normalizedAccount = normalizeAccount(account);
 
+        // No dpixa method exists for subscriptions — use client.call() raw RPC
         try {
-            if (this.proxy.client.pixamind) {
-                return await this.proxy.client.pixamind.listAllSubscriptions(normalizedAccount);
-            }
+            return await this.proxy.client.call('bridge', 'list_all_subscriptions', { account: normalizedAccount });
         } catch (e) {
-            console.warn('[FollowAPI] pixamind.listAllSubscriptions failed:', e.message);
+            console.warn('[FollowAPI] list_all_subscriptions failed:', e.message);
         }
         return [];
     }
@@ -3541,7 +3430,7 @@ class BlockchainAPI {
     }
 
     async getTransactionHex(tx) {
-        return this.proxy.client.database.call('get_transaction_hex', [tx]);
+        return this.proxy.client.call('condenser_api', 'get_transaction_hex', [tx]);
     }
 
     /**
@@ -3689,68 +3578,31 @@ class ResourceCreditsAPI {
     constructor(proxy) { this.proxy = proxy; }
 
     async getResourceParams() {
-        return this.proxy.client.rc.getResourceParams();
+        // No dpixa method — client.call() raw RPC
+        return this.proxy.client.call('rc_api', 'get_resource_params', {});
     }
 
     async getResourcePool() {
-        return this.proxy.client.rc.getResourcePool();
+        // No dpixa method — client.call() raw RPC
+        return this.proxy.client.call('rc_api', 'get_resource_pool', {});
     }
 
     async findRcAccounts(accounts) {
         const normalizedAccounts = accounts.map(acc => normalizeAccount(acc)).filter(acc => acc && acc.length > 0);
+        // rc.findRCAccounts(usernames) — documented dpixa method
         return this.proxy.client.rc.findRCAccounts(normalizedAccounts);
     }
 
-    /**
-     * Get calculated RC mana for an account
-     * @param {string} account
-     * @returns {Promise<{current_mana: string, max_mana: string, percentage: number}>}
-     */
     async getRCMana(account) {
         const normalizedAccount = normalizeAccount(account);
-
-        try {
-            // Try using the client's built-in method first
-            if (this.proxy.client.rc.getRCMana) {
-                return await this.proxy.client.rc.getRCMana(normalizedAccount);
-            }
-        } catch (e) {
-            console.warn('[ResourceCreditsAPI] client.rc.getRCMana failed:', e.message);
-        }
-
-        // Fallback: Delegate to SDK calculateRCMana
-        const rcAccounts = await this.findRcAccounts([normalizedAccount]);
-        if (!rcAccounts || rcAccounts.length === 0) {
-            throw new PixaAPIError('Account not found', 'ACCOUNT_NOT_FOUND');
-        }
-
-        return this.proxy.client.rc.calculateRCMana(rcAccounts[0]);
+        // rc.getRCMana(username) — documented dpixa method
+        return this.proxy.client.rc.getRCMana(normalizedAccount);
     }
 
-    /**
-     * Get calculated voting power mana for an account
-     * @param {string} account
-     * @returns {Promise<{current_mana: string, max_mana: string, percentage: number}>}
-     */
     async getVPMana(account) {
         const normalizedAccount = normalizeAccount(account);
-
-        try {
-            // Try using the client's built-in method first
-            if (this.proxy.client.rc.getVPMana) {
-                return await this.proxy.client.rc.getVPMana(normalizedAccount);
-            }
-        } catch (e) {
-            console.warn('[ResourceCreditsAPI] client.rc.getVPMana failed:', e.message);
-        }
-
-        // Fallback: Delegate to SDK calculateVPMana
-        const accounts = await this.proxy.client.database.getAccounts([normalizedAccount]);
-        if (!accounts || accounts.length === 0) {
-            throw new PixaAPIError('Account not found', 'ACCOUNT_NOT_FOUND');
-        }
-
-        return this.proxy.client.rc.calculateVPMana(accounts[0]);
+        // rc.getVPMana(username) — documented dpixa method
+        return this.proxy.client.rc.getVPMana(normalizedAccount);
     }
 
     /**
@@ -3798,29 +3650,29 @@ class CommunitiesAPI {
     constructor(proxy) { this.proxy = proxy; }
 
     async getCommunity(name, observer = '') {
+        // pixamind.getCommunity({name}) — documented dpixa method
         try {
             if (this.proxy.client.pixamind) {
-                return await this.proxy.client.pixamind.getCommunity({ name, observer });
+                return await this.proxy.client.pixamind.getCommunity({ name });
             }
         } catch (e) {
-            console.warn('[CommunitiesAPI] pixamind.getCommunity failed:', e.message);
+            console.warn('[CommunitiesAPI] getCommunity failed:', e.message);
         }
         return null;
     }
 
     async listCommunities(options = {}) {
+        // No dpixa method — client.call() raw RPC
         try {
-            if (this.proxy.client.pixamind) {
-                return await this.proxy.client.pixamind.listCommunities({
-                    last: options.last || '',
-                    limit: options.limit || 100,
-                    query: options.query || null,
-                    sort: options.sort || 'rank',
-                    observer: options.observer || ''
-                });
-            }
+            return await this.proxy.client.call('bridge', 'list_communities', {
+                last: options.last || '',
+                limit: options.limit || 100,
+                query: options.query || null,
+                sort: options.sort || 'rank',
+                observer: options.observer || ''
+            });
         } catch (e) {
-            console.warn('[CommunitiesAPI] pixamind.listCommunities failed:', e.message);
+            console.warn('[CommunitiesAPI] listCommunities failed:', e.message);
         }
         return [];
     }
@@ -3828,12 +3680,11 @@ class CommunitiesAPI {
     async getSubscriptions(account) {
         const normalizedAccount = normalizeAccount(account);
 
+        // No dpixa method — client.call() raw RPC
         try {
-            if (this.proxy.client.pixamind) {
-                return await this.proxy.client.pixamind.listAllSubscriptions(normalizedAccount);
-            }
+            return await this.proxy.client.call('bridge', 'list_all_subscriptions', { account: normalizedAccount });
         } catch (e) {
-            console.warn('[CommunitiesAPI] pixamind.listAllSubscriptions failed:', e.message);
+            console.warn('[CommunitiesAPI] getSubscriptions failed:', e.message);
         }
         return [];
     }
@@ -3845,14 +3696,13 @@ class CommunitiesAPI {
 
         const q = {
             tag: options.tag || '',
-            limit: options.limit || 20,
-            start_author: options.start_author || '',
-            start_permlink: options.start_permlink || ''
+            limit: parseInt(options.limit, 10) || 20
         };
+        if (options.start_author) q.start_author = options.start_author;
+        if (options.start_permlink) q.start_permlink = options.start_permlink;
 
         const queryKey = QueryCacheManager.buildKey(`community_ranked_${dbSort}`, q);
 
-        // v3.4.0: Check query cache
         if (this.proxy.queryCache && this.proxy.entityStore) {
             const cached = await this.proxy.queryCache.get(queryKey, dbSort);
             if (cached) {
@@ -3861,34 +3711,19 @@ class CommunitiesAPI {
             }
         }
 
+        // pixamind.getRankedPosts({sort, tag, limit}) — documented dpixa method
         let rawResults = null;
 
         try {
-            rawResults = await this.proxy.client.database.getDiscussions(dbSort, q);
+            rawResults = await this.proxy.client.pixamind.getRankedPosts({
+                sort: dbSort, tag: q.tag || '', limit: q.limit
+            });
         } catch (e) {
-            console.warn('[CommunitiesAPI] getDiscussions failed:', e.message);
-        }
-
-        if (!rawResults) {
-            try {
-                if (this.proxy.client.pixamind) {
-                    rawResults = await this.proxy.client.pixamind.getRankedPosts({
-                        sort: options.sort || 'trending',
-                        tag: options.tag || '',
-                        observer: options.observer || '',
-                        limit: options.limit || 20,
-                        start_author: options.start_author || '',
-                        start_permlink: options.start_permlink || ''
-                    });
-                }
-            } catch (e) {
-                console.warn('[CommunitiesAPI] pixamind.getRankedPosts failed:', e.message);
-            }
+            console.warn(`[CommunitiesAPI] getRankedPosts(${dbSort}) failed:`, e.message);
         }
 
         if (!rawResults || !Array.isArray(rawResults)) return [];
 
-        // Sanitize, store, cache
         if (this.proxy.sanitizationPipeline && this.proxy.entityStore && this.proxy.queryCache) {
             const ids = [];
             for (const raw of rawResults) {
@@ -3903,7 +3738,8 @@ class CommunitiesAPI {
             return (await this.proxy.entityStore.resolve('posts', ids)).filter(Boolean);
         }
 
-        return rawResults;
+        console.error('[CommunitiesAPI] Sanitizer pipeline not available — refusing to serve raw content');
+        return [];
     }
 
     async getAccountPosts(account, sort = 'blog', options = {}) {
@@ -3912,17 +3748,20 @@ class CommunitiesAPI {
         const validSorts = ['blog', 'feed', 'comments', 'trending', 'created', 'hot', 'promoted', 'active', 'votes', 'children', 'cashout'];
         const dbSort = validSorts.includes(sort) ? sort : 'blog';
 
-        const q = {
-            tag: normalizedAccount,
-            limit: options.limit || 20,
-            start_author: options.start_author || '',
-            start_permlink: options.start_permlink || ''
-        };
+        // get_discussions_by_comments uses start_author; blog/feed/others use tag
+        const q = { limit: parseInt(options.limit, 10) || 20 };
+        if (dbSort === 'comments') {
+            q.start_author = normalizedAccount;
+            if (options.start_permlink) q.start_permlink = options.start_permlink;
+        } else {
+            q.tag = normalizedAccount;
+            if (options.start_author) q.start_author = options.start_author;
+            if (options.start_permlink) q.start_permlink = options.start_permlink;
+        }
 
         const entityType = sort === 'comments' ? 'comments' : 'posts';
         const queryKey = QueryCacheManager.buildKey(`community_account_${dbSort}`, q);
 
-        // v3.4.0: Check query cache
         if (this.proxy.queryCache && this.proxy.entityStore) {
             const cached = await this.proxy.queryCache.get(queryKey, sort);
             if (cached) {
@@ -3931,29 +3770,13 @@ class CommunitiesAPI {
             }
         }
 
+        // database.getDiscussions(by, query) — documented dpixa method, handles all sorts
         let rawResults = null;
 
         try {
             rawResults = await this.proxy.client.database.getDiscussions(dbSort, q);
         } catch (e) {
-            console.warn('[CommunitiesAPI] getDiscussions failed:', e.message);
-        }
-
-        if (!rawResults) {
-            try {
-                if (this.proxy.client.pixamind) {
-                    rawResults = await this.proxy.client.pixamind.getAccountPosts({
-                        account: normalizedAccount,
-                        sort: sort,
-                        observer: options.observer || '',
-                        limit: options.limit || 20,
-                        start_author: options.start_author || '',
-                        start_permlink: options.start_permlink || ''
-                    });
-                }
-            } catch (e) {
-                console.warn('[CommunitiesAPI] pixamind.getAccountPosts failed:', e.message);
-            }
+            console.warn(`[CommunitiesAPI] getAccountPosts(${dbSort}) failed:`, e.message);
         }
 
         if (!rawResults || !Array.isArray(rawResults)) return [];
@@ -3973,7 +3796,9 @@ class CommunitiesAPI {
             return (await this.proxy.entityStore.resolve(entityType, ids)).filter(Boolean);
         }
 
-        return rawResults;
+        // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED
+        console.error('[CommunitiesAPI] Sanitizer pipeline not available — refusing to serve raw content');
+        return [];
     }
 }
 
@@ -3997,19 +3822,10 @@ class AccountByKeyAPI {
         });
 
         try {
-            // Use typed client.keys method
-            const result = await this.proxy.client.keys.getKeyReferences(keyStrings);
-            return result;
+            // keys.getKeyReferences(keys) — documented dpixa method
+            return await this.proxy.client.keys.getKeyReferences(keyStrings);
         } catch (e) {
-            console.warn('[AccountByKeyAPI] client.keys.getKeyReferences failed:', e.message);
-        }
-
-        try {
-            // Try condenser_api fallback
-            const result = await this.proxy.client.call('condenser_api', 'get_key_references', [keyStrings]);
-            return { accounts: result };
-        } catch (e) {
-            console.warn('[AccountByKeyAPI] condenser_api.get_key_references failed:', e.message);
+            console.warn('[AccountByKeyAPI] getKeyReferences failed:', e.message);
         }
 
         return { accounts: keys.map(() => []) };
@@ -4807,6 +4623,21 @@ class ContentSanitizer {
     }
 
     /**
+     * SECURITY PATCH (v3.5.2-patched): Fail-closed guard.
+     * Throws instead of silently returning fallback values when WASM is not ready.
+     * @param {string} methodName - Caller method name for error context
+     * @throws {PixaAPIError} if WASM engine is not initialized
+     */
+    _requireReady(methodName) {
+        if (!this.ready) {
+            throw new PixaAPIError(
+                `ContentSanitizer.${methodName}(): WASM engine not initialized — cannot sanitize safely`,
+                'SANITIZER_NOT_READY'
+            );
+        }
+    }
+
+    /**
      * Render a post body through pixa-content WASM sanitizer
      * Returns sanitized HTML, extracted images, extracted links, and word count.
      *
@@ -4816,22 +4647,18 @@ class ContentSanitizer {
      */
     renderPost(body, options = {}) {
         if (!body) return { html: '', images: [], links: [], wordCount: 0 };
+        this._requireReady('renderPost');
 
-        try {
-            const opts = { ...this.defaultOptions, ...options };
-            // v0.2: sanitizePost(body, optsJson) → PostResult { html, images, links }
-            const result = wasmSanitizePost(body, JSON.stringify(opts));
+        // SECURITY PATCH: No try/catch fallback — WASM errors must propagate
+        const opts = { ...this.defaultOptions, ...options };
+        const result = wasmSanitizePost(body, JSON.stringify(opts));
 
-            return {
-                html: result.html || '',
-                images: result.images || [],
-                links: result.links || [],
-                wordCount: this._countWords(result.html || body),
-            };
-        } catch (e) {
-            console.error('[ContentSanitizer] renderPost error:', e);
-            return { html: '', images: [], links: [], wordCount: 0 };
-        }
+        return {
+            html: result.html || '',
+            images: result.images || [],
+            links: result.links || [],
+            wordCount: this._countWords(result.html || body),
+        };
     }
 
     /**
@@ -4843,22 +4670,17 @@ class ContentSanitizer {
      */
     renderComment(body, options = {}) {
         if (!body) return { html: '', images: [], links: [], wordCount: 0 };
+        this._requireReady('renderComment');
 
-        try {
-            const opts = { ...this.defaultOptions, ...options };
-            // v0.2: sanitizeComment(body, optsJson) → CommentResult { html, links } (no images)
-            const result = wasmSanitizeComment(body, JSON.stringify(opts));
+        const opts = { ...this.defaultOptions, ...options };
+        const result = wasmSanitizeComment(body, JSON.stringify(opts));
 
-            return {
-                html: result.html || '',
-                images: [],  // v0.2: comments don't return images
-                links: result.links || [],
-                wordCount: this._countWords(result.html || body),
-            };
-        } catch (e) {
-            console.error('[ContentSanitizer] renderComment error:', e);
-            return { html: '', images: [], links: [], wordCount: 0 };
-        }
+        return {
+            html: result.html || '',
+            images: [],
+            links: result.links || [],
+            wordCount: this._countWords(result.html || body),
+        };
     }
 
     /**
@@ -4870,14 +4692,10 @@ class ContentSanitizer {
      */
     renderMemo(body, options = {}) {
         if (!body) return { html: '' };
+        this._requireReady('renderMemo');
 
-        try {
-            const opts = { ...this.defaultOptions, ...options };
-            return wasmSanitizeMemo(body, JSON.stringify(opts));
-        } catch (e) {
-            console.error('[ContentSanitizer] renderMemo error:', e);
-            return { html: '' };
-        }
+        const opts = { ...this.defaultOptions, ...options };
+        return wasmSanitizeMemo(body, JSON.stringify(opts));
     }
 
     /**
@@ -4889,13 +4707,8 @@ class ContentSanitizer {
      */
     safeJson(jsonStr) {
         if (!jsonStr) return '{}';
-
-        try {
-            return wasmSafeJson(jsonStr);
-        } catch (e) {
-            console.error('[ContentSanitizer] safeJson error:', e);
-            return '{}';
-        }
+        this._requireReady('safeJson');
+        return wasmSafeJson(jsonStr);
     }
 
     /**
@@ -4907,13 +4720,8 @@ class ContentSanitizer {
      */
     safeString(s, maxLen = 10000) {
         if (!s || typeof s !== 'string') return '';
-
-        try {
-            return wasmSafeString(s, maxLen) || '';
-        } catch (e) {
-            console.error('[ContentSanitizer] safeString error:', e);
-            return '';
-        }
+        this._requireReady('safeString');
+        return wasmSafeString(s, maxLen) || '';
     }
 
     /**
@@ -4923,13 +4731,8 @@ class ContentSanitizer {
      */
     extractPlainText(body) {
         if (!body) return '';
-
-        try {
-            return wasmExtractPlainText(body);
-        } catch (e) {
-            console.error('[ContentSanitizer] extractPlainText error:', e);
-            return '';
-        }
+        this._requireReady('extractPlainText');
+        return wasmExtractPlainText(body);
     }
 
     /**
@@ -4940,13 +4743,8 @@ class ContentSanitizer {
      */
     summarize(body, sentenceCount = 3) {
         if (!body) return { summary: '', keywords: [], sentences: [] };
-
-        try {
-            return wasmSummarizeContent(body, sentenceCount);
-        } catch (e) {
-            console.error('[ContentSanitizer] summarize error:', e);
-            return { summary: '', keywords: [], sentences: [] };
-        }
+        this._requireReady('summarize');
+        return wasmSummarizeContent(body, sentenceCount);
     }
 
     /**
@@ -4956,13 +4754,8 @@ class ContentSanitizer {
      */
     sanitizeUsername(rawUsername) {
         if (!rawUsername) return '';
-
-        try {
-            return wasmSanitizeUsername(rawUsername);
-        } catch (e) {
-            console.error('[ContentSanitizer] sanitizeUsername error:', e);
-            return '';
-        }
+        this._requireReady('sanitizeUsername');
+        return wasmSanitizeUsername(rawUsername);
     }
 
     /**
