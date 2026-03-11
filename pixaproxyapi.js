@@ -2948,12 +2948,15 @@ class BroadcastAPI {
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedFollower, 'posting');
-        return this.proxy.client.broadcast.customJson({
-            required_auths: [],
-            required_posting_auths: [normalizedFollower],
-            id: 'follow',
-            json: JSON.stringify(['follow', { follower: normalizedFollower, following: normalizedFollowing, what: ['blog'] }])
-        }, PrivateKey.fromString(key));
+        return this.proxy.client.broadcast.sendOperations(
+            [['custom_json', {
+                required_auths: [],
+                required_posting_auths: [normalizedFollower],
+                id: 'follow',
+                json: JSON.stringify(['follow', { follower: normalizedFollower, following: normalizedFollowing, what: ['blog'] }])
+            }]],
+            PrivateKey.fromString(key)
+        );
     }
 
     async unfollow(follower, following) {
@@ -2965,12 +2968,15 @@ class BroadcastAPI {
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedFollower, 'posting');
-        return this.proxy.client.broadcast.customJson({
-            required_auths: [],
-            required_posting_auths: [normalizedFollower],
-            id: 'follow',
-            json: JSON.stringify(['follow', { follower: normalizedFollower, following: normalizedFollowing, what: [] }])
-        }, PrivateKey.fromString(key));
+        return this.proxy.client.broadcast.sendOperations(
+            [['custom_json', {
+                required_auths: [],
+                required_posting_auths: [normalizedFollower],
+                id: 'follow',
+                json: JSON.stringify(['follow', { follower: normalizedFollower, following: normalizedFollowing, what: [] }])
+            }]],
+            PrivateKey.fromString(key)
+        );
     }
 
     /**
@@ -2985,12 +2991,15 @@ class BroadcastAPI {
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedFollower, 'posting');
-        return this.proxy.client.broadcast.customJson({
-            required_auths: [],
-            required_posting_auths: [normalizedFollower],
-            id: 'follow',
-            json: JSON.stringify(['follow', { follower: normalizedFollower, following: normalizedFollowing, what: ['ignore'] }])
-        }, PrivateKey.fromString(key));
+        return this.proxy.client.broadcast.sendOperations(
+            [['custom_json', {
+                required_auths: [],
+                required_posting_auths: [normalizedFollower],
+                id: 'follow',
+                json: JSON.stringify(['follow', { follower: normalizedFollower, following: normalizedFollowing, what: ['ignore'] }])
+            }]],
+            PrivateKey.fromString(key)
+        );
     }
 
     async reblog(account, author, permlink) {
@@ -3002,26 +3011,45 @@ class BroadcastAPI {
         }
 
         const key = await this.proxy.keyManager.requestKey(normalizedAccount, 'posting');
-        return this.proxy.client.broadcast.customJson({
-            required_auths: [],
-            required_posting_auths: [normalizedAccount],
-            id: 'follow',
-            json: JSON.stringify(['reblog', { account: normalizedAccount, author: normalizedAuthor, permlink }])
-        }, PrivateKey.fromString(key));
+        return this.proxy.client.broadcast.sendOperations(
+            [['custom_json', {
+                required_auths: [],
+                required_posting_auths: [normalizedAccount],
+                id: 'follow',
+                json: JSON.stringify(['reblog', { account: normalizedAccount, author: normalizedAuthor, permlink }])
+            }]],
+            PrivateKey.fromString(key)
+        );
     }
 
-    async customJson(params) {
+    /**
+     * Broadcast a custom_json operation
+     * @param {object} params - { requiredAuths, requiredPostingAuths, id, json }
+     * @param {object} [auths] - Optional override keys. When provided, bypasses
+     *   keyManager and uses the supplied WIF directly.
+     *   Shape: { active: '<wif>', posting: '<wif>' }
+     */
+    async customJson(params, auths) {
         const { requiredAuths = [], requiredPostingAuths = [], id, json } = params;
         const signingAccount = requiredAuths[0] || requiredPostingAuths[0];
         const keyType = requiredAuths.length > 0 ? 'active' : 'posting';
-        const key = await this.proxy.keyManager.requestKey(normalizeAccount(signingAccount), keyType);
 
-        return this.proxy.client.broadcast.customJson({
-            required_auths: requiredAuths.map(a => normalizeAccount(a)),
-            required_posting_auths: requiredPostingAuths.map(a => normalizeAccount(a)),
-            id,
-            json: typeof json === 'string' ? json : JSON.stringify(json)
-        }, PrivateKey.fromString(key));
+        let key;
+        if (auths && auths[keyType]) {
+            key = auths[keyType];
+        } else {
+            key = await this.proxy.keyManager.requestKey(normalizeAccount(signingAccount), keyType);
+        }
+
+        return this.proxy.client.broadcast.sendOperations(
+            [['custom_json', {
+                required_auths: requiredAuths.map(a => normalizeAccount(a)),
+                required_posting_auths: requiredPostingAuths.map(a => normalizeAccount(a)),
+                id,
+                json: typeof json === 'string' ? json : JSON.stringify(json)
+            }]],
+            PrivateKey.fromString(key)
+        );
     }
 
     async deleteComment(author, permlink) {
