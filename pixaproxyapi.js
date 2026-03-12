@@ -1,7 +1,7 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.6.2
+ * @version 3.6.3
  *
  * API Groups and Methods:
  *
@@ -858,8 +858,7 @@ export class PixaProxyAPI {
      * @param {string} account - Account username
      * @param {object} [options]
      * @param {boolean} [options.requestPrivate=true] - Whether to request private keys (triggers PIN)
-     * @param {string[]} [options.keyTypes=['posting','active','memo']] - Which key types to request
-     *   (owner is intentionally excluded by default — pass explicitly when needed)
+     * @param {string[]} [options.keyTypes=['posting','active','owner','memo']] - Which key types to request
      * @returns {Promise<{publicKeys: object, privateKeys: object, availableTypes: string[]}>}
      */
     async getWalletKeys(account, options = {}) {
@@ -869,7 +868,7 @@ export class PixaProxyAPI {
         }
 
         const requestPrivate = options.requestPrivate !== false;
-        const keyTypes = options.keyTypes || ['posting', 'active', 'memo'];
+        const keyTypes = options.keyTypes || ['posting', 'active', 'owner', 'memo'];
 
         const publicKeys = { posting: '', active: '', owner: '', memo: '' };
         const privateKeys = { posting: '', active: '', owner: '', memo: '' };
@@ -2731,7 +2730,10 @@ class BroadcastAPI {
         const requiresActive = auth.owner || auth.active || auth.posting || auth.memo_key ||
             (params.jsonMetadata !== undefined && params.jsonMetadata !== null);
 
-        const keyType = requiresActive ? 'active' : 'posting';
+        // Changing the owner authority requires the owner key for signing;
+        // all other authority changes require the active key.
+        const requiresOwner = !!auth.owner;
+        const keyType = requiresOwner ? 'owner' : requiresActive ? 'active' : 'posting';
         const key = await this.proxy.keyManager.requestKey(normalizedAccount, keyType);
 
         const ensureString = (val) => {
