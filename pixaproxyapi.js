@@ -1,7 +1,7 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.6.0
+ * @version 3.6.1
  *
  * API Groups and Methods:
  *
@@ -286,8 +286,97 @@ const CONFIG = {
     APP_NAME: 'pixagram/3.5.2',
     PAGINATION_LIMIT: 20,
     CHAIN_ID: null,
-    ADDRESS_PREFIX: 'PIX'
+    ADDRESS_PREFIX: 'PIX',
+
+    // Asset symbol mapping: [blockchain_symbol, display_symbol]
+    // Entry[0] = on-chain name (used in broadcast operations)
+    // Entry[1] = display name  (used after sanitization / in the app)
+    ASSET_LIQUID: ['TESTS', 'PXA'],
+    ASSET_SUPRA:  ['TBD',   'PXS'],
+    ASSET_POWER:  ['VESTS', 'PXP'],
 };
+
+// ============================================
+// Asset Symbol Translation
+// ============================================
+
+// Build lookup maps from CONFIG asset definitions
+// fromChain: blockchain_symbol → display_symbol  (used when sanitizing data FROM the chain)
+// toChain:   display_symbol → blockchain_symbol   (used when preparing data FOR broadcast)
+const ASSET_MAP_FROM_CHAIN = {};
+const ASSET_MAP_TO_CHAIN = {};
+const ASSET_PRECISION = {};
+
+for (const def of [CONFIG.ASSET_LIQUID, CONFIG.ASSET_SUPRA, CONFIG.ASSET_POWER]) {
+    const [chainSymbol, displaySymbol] = def;
+    ASSET_MAP_FROM_CHAIN[chainSymbol] = displaySymbol;
+    ASSET_MAP_TO_CHAIN[displaySymbol] = chainSymbol;
+}
+
+// Precision: VESTS / PXP use 6 decimal places; all others use 3
+ASSET_PRECISION[CONFIG.ASSET_POWER[0]] = 6;   // VESTS
+ASSET_PRECISION[CONFIG.ASSET_POWER[1]] = 6;   // PXP
+ASSET_PRECISION[CONFIG.ASSET_LIQUID[0]] = 3;   // TESTS
+ASSET_PRECISION[CONFIG.ASSET_LIQUID[1]] = 3;   // PXA
+ASSET_PRECISION[CONFIG.ASSET_SUPRA[0]] = 3;    // TBD
+ASSET_PRECISION[CONFIG.ASSET_SUPRA[1]] = 3;    // PXS
+
+/**
+ * Parse an asset string into its numeric amount and symbol.
+ * @param {string} assetStr - e.g. "123.456 TESTS" or "0.000000 VESTS"
+ * @returns {{ amount: number, symbol: string, raw: string } | null}
+ */
+function parseAsset(assetStr) {
+    if (typeof assetStr !== 'string') return null;
+    const parts = assetStr.trim().split(' ');
+    if (parts.length !== 2) return null;
+    const amount = parseFloat(parts[0]);
+    if (isNaN(amount)) return null;
+    return { amount, symbol: parts[1], raw: assetStr };
+}
+
+/**
+ * Format a parsed asset back to a string with the correct precision.
+ * @param {number} amount
+ * @param {string} symbol
+ * @returns {string}
+ */
+function formatAssetString(amount, symbol) {
+    const precision = ASSET_PRECISION[symbol] ?? 3;
+    return `${amount.toFixed(precision)} ${symbol}`;
+}
+
+/**
+ * Translate an asset string from blockchain symbols to display symbols.
+ * Used when sanitizing data coming FROM the chain (e.g. TESTS → PXA).
+ * If the symbol is not in the translation map, returns the asset as-is
+ * (re-formatted with correct precision).
+ *
+ * @param {string} assetStr - e.g. "100.000 TESTS"
+ * @returns {string} e.g. "100.000 PXA"
+ */
+function translateAssetFromChain(assetStr) {
+    const parsed = parseAsset(assetStr);
+    if (!parsed) return assetStr;
+    const displaySymbol = ASSET_MAP_FROM_CHAIN[parsed.symbol] ?? parsed.symbol;
+    return formatAssetString(parsed.amount, displaySymbol);
+}
+
+/**
+ * Translate an asset string from display symbols to blockchain symbols.
+ * Used when preparing data FOR broadcast operations (e.g. PXA → TESTS).
+ * If the symbol is not in the translation map, returns the asset as-is
+ * (re-formatted with correct precision).
+ *
+ * @param {string} assetStr - e.g. "100.000 PXA"
+ * @returns {string} e.g. "100.000 TESTS"
+ */
+function translateAssetToChain(assetStr) {
+    const parsed = parseAsset(assetStr);
+    if (!parsed) return assetStr;
+    const chainSymbol = ASSET_MAP_TO_CHAIN[parsed.symbol] ?? parsed.symbol;
+    return formatAssetString(parsed.amount, chainSymbol);
+}
 
 // ============================================
 // VALIDATORS (v3.5.0) — JS-side format checks
@@ -1471,8 +1560,8 @@ export class PixaProxyAPI {
             posting_json_metadata: safePostingMetaStr,
             reputation:       VALIDATORS.safe_number(account.reputation) ?? 0,
             reputation_score: this.formatter.reputation(account.reputation),
-            balance: VALIDATORS.safe_asset(account.balance) || '0.000 PIXA',
-            vesting_shares: VALIDATORS.safe_asset(account.vesting_shares) || '0.000000 VESTS',
+            balance: translateAssetFromChain(VALIDATORS.safe_asset(account.balance) || '0.000 PXA'),
+            vesting_shares: translateAssetFromChain(VALIDATORS.safe_asset(account.vesting_shares) || '0.000000 PXP'),
             voting_power: VALIDATORS.safe_number(account.voting_power) ?? 0,
             post_count: VALIDATORS.safe_number(account.post_count) ?? 0,
             created: VALIDATORS.safe_timestamp(account.created),
@@ -1537,9 +1626,9 @@ export class PixaProxyAPI {
             children: post.children ?? 0,
             net_votes: post.net_votes ?? 0,
             author_reputation: this.formatter.reputation(post.author_reputation),
-            pending_payout_value: post.pending_payout_value || '0.000 PXS',
-            total_payout_value: post.total_payout_value || '0.000 PXS',
-            curator_payout_value: post.curator_payout_value || '0.000 PXS',
+            pending_payout_value: translateAssetFromChain(post.pending_payout_value || '0.000 PXS'),
+            total_payout_value: translateAssetFromChain(post.total_payout_value || '0.000 PXS'),
+            curator_payout_value: translateAssetFromChain(post.curator_payout_value || '0.000 PXS'),
             url: post.url || '',
         };
     }
@@ -1600,9 +1689,9 @@ export class PixaProxyAPI {
             children: comment.children ?? 0,
             net_votes: comment.net_votes ?? 0,
             author_reputation: this.formatter.reputation(comment.author_reputation),
-            pending_payout_value: comment.pending_payout_value || '0.000 PXS',
-            total_payout_value: comment.total_payout_value || '0.000 PXS',
-            curator_payout_value: comment.curator_payout_value || '0.000 PXS',
+            pending_payout_value: translateAssetFromChain(comment.pending_payout_value || '0.000 PXS'),
+            total_payout_value: translateAssetFromChain(comment.total_payout_value || '0.000 PXS'),
+            curator_payout_value: translateAssetFromChain(comment.curator_payout_value || '0.000 PXS'),
             root_author: comment.root_author || '',
             root_permlink: comment.root_permlink || '',
             url: comment.url || '',
@@ -2684,7 +2773,7 @@ class BroadcastAPI {
         const op = {
             author: normalizedAuthor,
             permlink,
-            max_accepted_payout: maxAcceptedPayout || '1000000.000 PXS',
+            max_accepted_payout: translateAssetToChain(maxAcceptedPayout || '1000000.000 PXS'),
             percent_pxs: percentPxs !== undefined ? percentPxs : 10000,
             allow_votes: allowVotes !== undefined ? allowVotes : true,
             allow_curation_rewards: allowCurationRewards !== undefined ? allowCurationRewards : true,
@@ -2714,7 +2803,7 @@ class BroadcastAPI {
         return this.proxy.client.broadcast.transfer({
             from: normalizedFrom,
             to: normalizedTo,
-            amount,
+            amount: translateAssetToChain(amount),
             memo
         }, PrivateKey.fromString(key));
     }
@@ -2723,7 +2812,7 @@ class BroadcastAPI {
      * Power up (transfer to vesting)
      * @param {string} from - Source account
      * @param {string} to - Destination account (can be same or different)
-     * @param {string} amount - Amount in PIXA (e.g., "100.000 PIXA")
+     * @param {string} amount - Amount in PXA (e.g., "100.000 PXA")
      */
     async transferToVesting(from, to, amount) {
         const normalizedFrom = normalizeAccount(from);
@@ -2743,7 +2832,7 @@ class BroadcastAPI {
             [['transfer_to_vesting', {
                 from: normalizedFrom,
                 to: normalizedTo,
-                amount
+                amount: translateAssetToChain(amount)
             }]],
             PrivateKey.fromString(key)
         );
@@ -2752,7 +2841,7 @@ class BroadcastAPI {
     /**
      * Power down (withdraw vesting)
      * @param {string} account - Account to power down
-     * @param {string} vestingShares - Amount in VESTS (e.g., "1000000.000000 VESTS"), use "0.000000 VESTS" to cancel
+     * @param {string} vestingShares - Amount in PXP (e.g., "1000000.000000 PXP"), use "0.000000 PXP" to cancel
      */
     async withdrawVesting(account, vestingShares) {
         const normalizedAccount = normalizeAccount(account);
@@ -2770,7 +2859,7 @@ class BroadcastAPI {
         return this.proxy.client.broadcast.sendOperations(
             [['withdraw_vesting', {
                 account: normalizedAccount,
-                vesting_shares: vestingShares
+                vesting_shares: translateAssetToChain(vestingShares)
             }]],
             PrivateKey.fromString(key)
         );
@@ -2780,7 +2869,7 @@ class BroadcastAPI {
      * Delegate vesting shares
      * @param {string} delegator - Account delegating
      * @param {string} delegatee - Account receiving delegation
-     * @param {string} vestingShares - Amount in VESTS (use "0.000000 VESTS" to undelegate)
+     * @param {string} vestingShares - Amount in PXP (use "0.000000 PXP" to undelegate)
      */
     async delegateVestingShares(delegator, delegatee, vestingShares) {
         const normalizedDelegator = normalizeAccount(delegator);
@@ -2800,7 +2889,7 @@ class BroadcastAPI {
             [['delegate_vesting_shares', {
                 delegator: normalizedDelegator,
                 delegatee: normalizedDelegatee,
-                vesting_shares: vestingShares
+                vesting_shares: translateAssetToChain(vestingShares)
             }]],
             PrivateKey.fromString(key)
         );
@@ -2827,7 +2916,7 @@ class BroadcastAPI {
             [['transfer_to_savings', {
                 from: normalizedFrom,
                 to: normalizedTo,
-                amount,
+                amount: translateAssetToChain(amount),
                 memo
             }]],
             PrivateKey.fromString(key)
@@ -2856,7 +2945,7 @@ class BroadcastAPI {
                 from: normalizedFrom,
                 request_id: requestId,
                 to: normalizedTo,
-                amount,
+                amount: translateAssetToChain(amount),
                 memo
             }]],
             PrivateKey.fromString(key)
@@ -2886,9 +2975,9 @@ class BroadcastAPI {
     /**
      * Claim pending rewards
      * @param {string} account - Account claiming rewards
-     * @param {string} rewardPixa - PIXA reward to claim (e.g., "1.000 PIXA")
+     * @param {string} rewardPixa - PXA reward to claim (e.g., "1.000 PXA")
      * @param {string} rewardPxs - PXS reward to claim (e.g., "0.500 PXS")
-     * @param {string} rewardVests - VESTS reward to claim (e.g., "100.000000 VESTS")
+     * @param {string} rewardVests - PXP reward to claim (e.g., "100.000000 PXP")
      */
     async claimRewardBalance(account, rewardPixa, rewardPxs, rewardVests) {
         const normalizedAccount = normalizeAccount(account);
@@ -2905,9 +2994,9 @@ class BroadcastAPI {
         const key = await this.proxy.keyManager.requestKey(normalizedAccount, 'posting');
         return this.proxy.client.broadcast.claimRewardBalance({
             account: normalizedAccount,
-            reward_pixa: rewardPixa,
-            reward_pxs: rewardPxs,
-            reward_vests: rewardVests
+            reward_pixa: translateAssetToChain(rewardPixa),
+            reward_pxs: translateAssetToChain(rewardPxs),
+            reward_vests: translateAssetToChain(rewardVests)
         }, PrivateKey.fromString(key));
     }
 
@@ -2929,7 +3018,7 @@ class BroadcastAPI {
             [['recurrent_transfer', {
                 from: normalizedFrom,
                 to: normalizedTo,
-                amount,
+                amount: translateAssetToChain(amount),
                 memo,
                 recurrence, // Hours between transfers
                 executions, // Number of transfers (0 to cancel)
@@ -3082,7 +3171,7 @@ class BroadcastAPI {
         const key = await this.proxy.keyManager.requestKey(normalizedCreator, 'active');
         return this.proxy.client.broadcast.sendOperations(
             [['account_create', {
-                fee,
+                fee: translateAssetToChain(fee),
                 creator: normalizedCreator,
                 new_account_name: normalizedNewAccount,
                 owner,
@@ -3110,8 +3199,8 @@ class BroadcastAPI {
         const key = await this.proxy.keyManager.requestKey(normalizedCreator, 'active');
         return this.proxy.client.broadcast.sendOperations(
             [['account_create_with_delegation', {
-                fee,
-                delegation,
+                fee: translateAssetToChain(fee),
+                delegation: translateAssetToChain(delegation),
                 creator: normalizedCreator,
                 new_account_name: normalizedNewAccount,
                 owner,
@@ -3186,7 +3275,7 @@ class BroadcastAPI {
                 url,
                 block_signing_key: blockSigningKey,
                 props,
-                fee
+                fee: translateAssetToChain(fee)
             }]],
             PrivateKey.fromString(key)
         );
@@ -3231,8 +3320,8 @@ class BroadcastAPI {
             [['limit_order_create', {
                 owner: normalizedOwner,
                 orderid: orderId,
-                amount_to_sell: amountToSell,
-                min_to_receive: minToReceive,
+                amount_to_sell: translateAssetToChain(amountToSell),
+                min_to_receive: translateAssetToChain(minToReceive),
                 fill_or_kill: fillOrKill,
                 expiration: expiration || new Date(Date.now() + 28 * 24 * 60 * 60 * 1000).toISOString().slice(0, -5)
             }]],
@@ -3261,7 +3350,7 @@ class BroadcastAPI {
     }
 
     /**
-     * Convert PIXA to PXS
+     * Convert PXA to PXS
      */
     async convertPixa(owner, amount, requestId) {
         const normalizedOwner = normalizeAccount(owner);
@@ -3279,7 +3368,7 @@ class BroadcastAPI {
         return this.proxy.client.broadcast.sendOperations(
             [['convert', {
                 owner: normalizedOwner,
-                amount,
+                amount: translateAssetToChain(amount),
                 requestid: requestId
             }]],
             PrivateKey.fromString(key)
@@ -4068,20 +4157,20 @@ class SanitizationPipeline {
             reputation:       VALIDATORS.safe_number(raw.reputation) ?? 0,
             reputation_score: this.formatter ? this.formatter.reputation(raw.reputation) : 25,
 
-            // Balances
-            balance:                  VALIDATORS.safe_asset(raw.balance) || '0.000 PIXA',
-            savings_balance:          VALIDATORS.safe_asset(raw.savings_balance) || '0.000 PIXA',
-            pxs_balance:              VALIDATORS.safe_asset(raw.pxs_balance) || '0.000 PXS',
-            savings_pxs_balance:      VALIDATORS.safe_asset(raw.savings_pxs_balance) || '0.000 PXS',
-            vesting_shares:           VALIDATORS.safe_asset(raw.vesting_shares) || '0.000000 VESTS',
-            delegated_vesting_shares: VALIDATORS.safe_asset(raw.delegated_vesting_shares) || '0.000000 VESTS',
-            received_vesting_shares:  VALIDATORS.safe_asset(raw.received_vesting_shares) || '0.000000 VESTS',
-            vesting_withdraw_rate:    VALIDATORS.safe_asset(raw.vesting_withdraw_rate) || '0.000000 VESTS',
-            reward_pixa_balance:      VALIDATORS.safe_asset(raw.reward_pixa_balance) || '0.000 PIXA',
-            reward_pxs_balance:       VALIDATORS.safe_asset(raw.reward_pxs_balance) || '0.000 PXS',
-            reward_vesting_balance:   VALIDATORS.safe_asset(raw.reward_vesting_balance) || '0.000000 VESTS',
-            reward_vesting_pixa:      VALIDATORS.safe_asset(raw.reward_vesting_pixa) || '0.000 PIXA',
-            post_voting_power:        VALIDATORS.safe_asset(raw.post_voting_power) || '0.000000 VESTS',
+            // Balances (translate chain symbols → display symbols)
+            balance:                  translateAssetFromChain(VALIDATORS.safe_asset(raw.balance) || '0.000 PXA'),
+            savings_balance:          translateAssetFromChain(VALIDATORS.safe_asset(raw.savings_balance) || '0.000 PXA'),
+            pxs_balance:              translateAssetFromChain(VALIDATORS.safe_asset(raw.pxs_balance) || '0.000 PXS'),
+            savings_pxs_balance:      translateAssetFromChain(VALIDATORS.safe_asset(raw.savings_pxs_balance) || '0.000 PXS'),
+            vesting_shares:           translateAssetFromChain(VALIDATORS.safe_asset(raw.vesting_shares) || '0.000000 PXP'),
+            delegated_vesting_shares: translateAssetFromChain(VALIDATORS.safe_asset(raw.delegated_vesting_shares) || '0.000000 PXP'),
+            received_vesting_shares:  translateAssetFromChain(VALIDATORS.safe_asset(raw.received_vesting_shares) || '0.000000 PXP'),
+            vesting_withdraw_rate:    translateAssetFromChain(VALIDATORS.safe_asset(raw.vesting_withdraw_rate) || '0.000000 PXP'),
+            reward_pixa_balance:      translateAssetFromChain(VALIDATORS.safe_asset(raw.reward_pixa_balance) || '0.000 PXA'),
+            reward_pxs_balance:       translateAssetFromChain(VALIDATORS.safe_asset(raw.reward_pxs_balance) || '0.000 PXS'),
+            reward_vesting_balance:   translateAssetFromChain(VALIDATORS.safe_asset(raw.reward_vesting_balance) || '0.000000 PXP'),
+            reward_vesting_pixa:      translateAssetFromChain(VALIDATORS.safe_asset(raw.reward_vesting_pixa) || '0.000 PXA'),
+            post_voting_power:        translateAssetFromChain(VALIDATORS.safe_asset(raw.post_voting_power) || '0.000000 PXP'),
 
             // Voting / mana
             voting_power:    VALIDATORS.safe_number(raw.voting_power) ?? 0,
@@ -4209,13 +4298,13 @@ class SanitizationPipeline {
                     .filter(Boolean)
                 : [],
 
-            // Payouts
-            total_payout_value:         VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
-            curator_payout_value:       VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
-            pending_payout_value:       VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
-            total_pending_payout_value: VALIDATORS.safe_asset(raw.total_pending_payout_value) || '0.000 PXS',
-            max_accepted_payout:        VALIDATORS.safe_asset(raw.max_accepted_payout) || '1000000.000 PXS',
-            promoted:                   VALIDATORS.safe_asset(raw.promoted) || '0.000 PXS',
+            // Payouts (translate chain symbols → display symbols)
+            total_payout_value:         translateAssetFromChain(VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS'),
+            curator_payout_value:       translateAssetFromChain(VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS'),
+            pending_payout_value:       translateAssetFromChain(VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS'),
+            total_pending_payout_value: translateAssetFromChain(VALIDATORS.safe_asset(raw.total_pending_payout_value) || '0.000 PXS'),
+            max_accepted_payout:        translateAssetFromChain(VALIDATORS.safe_asset(raw.max_accepted_payout) || '1000000.000 PXS'),
+            promoted:                   translateAssetFromChain(VALIDATORS.safe_asset(raw.promoted) || '0.000 PXS'),
             percent_pxs:                VALIDATORS.safe_percent(raw.percent_pxs) ?? 10000,
             author_rewards:             VALIDATORS.safe_number(raw.author_rewards) ?? 0,
 
@@ -4312,12 +4401,12 @@ class SanitizationPipeline {
                     .filter(Boolean)
                 : [],
 
-            // Payouts
-            pending_payout_value:       VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS',
-            total_payout_value:         VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS',
-            curator_payout_value:       VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS',
-            total_pending_payout_value: VALIDATORS.safe_asset(raw.total_pending_payout_value) || '0.000 PXS',
-            promoted:                   VALIDATORS.safe_asset(raw.promoted) || '0.000 PXS',
+            // Payouts (translate chain symbols → display symbols)
+            pending_payout_value:       translateAssetFromChain(VALIDATORS.safe_asset(raw.pending_payout_value) || '0.000 PXS'),
+            total_payout_value:         translateAssetFromChain(VALIDATORS.safe_asset(raw.total_payout_value) || '0.000 PXS'),
+            curator_payout_value:       translateAssetFromChain(VALIDATORS.safe_asset(raw.curator_payout_value) || '0.000 PXS'),
+            total_pending_payout_value: translateAssetFromChain(VALIDATORS.safe_asset(raw.total_pending_payout_value) || '0.000 PXS'),
+            promoted:                   translateAssetFromChain(VALIDATORS.safe_asset(raw.promoted) || '0.000 PXS'),
             author_rewards:             VALIDATORS.safe_number(raw.author_rewards) ?? 0,
 
             // Flags
@@ -5811,7 +5900,11 @@ export {
 export {
     normalizeAccount,
     getRandomBytes,
-    bytesToHex
+    bytesToHex,
+    translateAssetFromChain,
+    translateAssetToChain,
+    parseAsset,
+    formatAssetString
 };
 
 // Re-export SDK utility helpers
