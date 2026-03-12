@@ -1,7 +1,7 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.6.1
+ * @version 3.6.2
  *
  * API Groups and Methods:
  *
@@ -26,6 +26,7 @@
  *   - summarizeContent(body, sentenceCount)
  *   - sanitizeUsername(rawUsername)
  *   - hasVaultConfig()
+ *   - getWalletKeys(account, options)
  *
  * database (DatabaseAPI):
  *   - call(method, params)
@@ -846,6 +847,97 @@ export class PixaProxyAPI {
         } catch (e) {
             return false;
         }
+    }
+
+    /**
+     * Retrieve wallet keys for an account.
+     * Public keys are always returned from chain data.
+     * Private keys are returned from session/vault cache, triggering PIN dialog
+     * once if needed (unlocking one key loads all from vault).
+     *
+     * @param {string} account - Account username
+     * @param {object} [options]
+     * @param {boolean} [options.requestPrivate=true] - Whether to request private keys (triggers PIN)
+     * @param {string[]} [options.keyTypes=['posting','active','memo']] - Which key types to request
+     *   (owner is intentionally excluded by default — pass explicitly when needed)
+     * @returns {Promise<{publicKeys: object, privateKeys: object, availableTypes: string[]}>}
+     */
+    async getWalletKeys(account, options = {}) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) {
+            throw new PixaAPIError('Invalid account parameter', 'INVALID_ACCOUNT');
+        }
+
+        const requestPrivate = options.requestPrivate !== false;
+        const keyTypes = options.keyTypes || ['posting', 'active', 'memo'];
+
+        const publicKeys = { posting: '', active: '', owner: '', memo: '' };
+        const privateKeys = { posting: '', active: '', owner: '', memo: '' };
+        const availableTypes = [];
+
+        // 1. Get public keys from chain account data
+        try {
+            const [accountData] = await this.client.database.getAccounts([normalizedAccount]);
+            if (accountData) {
+                if (accountData.posting?.key_auths?.[0]) {
+                    publicKeys.posting = accountData.posting.key_auths[0][0] || '';
+                }
+                if (accountData.active?.key_auths?.[0]) {
+                    publicKeys.active = accountData.active.key_auths[0][0] || '';
+                }
+                if (accountData.owner?.key_auths?.[0]) {
+                    publicKeys.owner = accountData.owner.key_auths[0][0] || '';
+                }
+                if (accountData.memo_key) {
+                    publicKeys.memo = accountData.memo_key;
+                }
+            }
+        } catch (e) {
+            console.warn('[getWalletKeys] Failed to fetch account public keys:', e.message);
+        }
+
+        // 2. Get private keys from session/vault (triggers PIN once if needed)
+        if (requestPrivate && this.keyManager) {
+            // Request the first key type — this triggers PIN dialog if vault is locked.
+            // unlockWithPin loads ALL vault keys into session cache, so subsequent
+            // requestKey calls will resolve from cache without another PIN prompt.
+            const firstType = keyTypes[0];
+            if (firstType) {
+                try {
+                    const key = await this.keyManager.requestKey(normalizedAccount, firstType);
+                    if (key) {
+                        privateKeys[firstType] = key;
+                        availableTypes.push(firstType);
+                        // Derive public key as fallback if chain data was missing
+                        try {
+                            const pub = PrivateKey.fromString(key).createPublic().toString();
+                            if (!publicKeys[firstType]) publicKeys[firstType] = pub;
+                        } catch (_) {}
+                    }
+                } catch (e) {
+                    // Key not available or PIN was cancelled
+                }
+            }
+
+            // Now request remaining types — should resolve from cache instantly
+            for (const type of keyTypes.slice(1)) {
+                try {
+                    const key = await this.keyManager.requestKey(normalizedAccount, type);
+                    if (key) {
+                        privateKeys[type] = key;
+                        availableTypes.push(type);
+                        try {
+                            const pub = PrivateKey.fromString(key).createPublic().toString();
+                            if (!publicKeys[type]) publicKeys[type] = pub;
+                        } catch (_) {}
+                    }
+                } catch (e) {
+                    // Key not available
+                }
+            }
+        }
+
+        return { publicKeys, privateKeys, availableTypes };
     }
 
     async logout() {
