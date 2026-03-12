@@ -1,7 +1,7 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.6.3
+ * @version 3.7.0
  *
  * API Groups and Methods:
  *
@@ -852,12 +852,13 @@ export class PixaProxyAPI {
     /**
      * Retrieve wallet keys for an account.
      * Public keys are always returned from chain data.
-     * Private keys are returned from session/vault cache, triggering PIN dialog
-     * once if needed (unlocking one key loads all from vault).
+     * Private keys are returned ONLY if already available in session/vault cache.
+     * This method NEVER triggers PIN dialog or key-entry prompts — it is silent.
+     * Use keyManager.requestKey(account, type) to prompt the user for a specific key.
      *
      * @param {string} account - Account username
      * @param {object} [options]
-     * @param {boolean} [options.requestPrivate=true] - Whether to request private keys (triggers PIN)
+     * @param {boolean} [options.requestPrivate=true] - Whether to look up private keys
      * @param {string[]} [options.keyTypes=['posting','active','owner','memo']] - Which key types to request
      * @returns {Promise<{publicKeys: object, privateKeys: object, availableTypes: string[]}>}
      */
@@ -895,36 +896,15 @@ export class PixaProxyAPI {
             console.warn('[getWalletKeys] Failed to fetch account public keys:', e.message);
         }
 
-        // 2. Get private keys from session/vault (triggers PIN once if needed)
+        // 2. Get private keys from session/vault silently (never triggers PIN dialog)
         if (requestPrivate && this.keyManager) {
-            // Request the first key type — this triggers PIN dialog if vault is locked.
-            // unlockWithPin loads ALL vault keys into session cache, so subsequent
-            // requestKey calls will resolve from cache without another PIN prompt.
-            const firstType = keyTypes[0];
-            if (firstType) {
+            for (const type of keyTypes) {
                 try {
-                    const key = await this.keyManager.requestKey(normalizedAccount, firstType);
-                    if (key) {
-                        privateKeys[firstType] = key;
-                        availableTypes.push(firstType);
-                        // Derive public key as fallback if chain data was missing
-                        try {
-                            const pub = PrivateKey.fromString(key).createPublic().toString();
-                            if (!publicKeys[firstType]) publicKeys[firstType] = pub;
-                        } catch (_) {}
-                    }
-                } catch (e) {
-                    // Key not available or PIN was cancelled
-                }
-            }
-
-            // Now request remaining types — should resolve from cache instantly
-            for (const type of keyTypes.slice(1)) {
-                try {
-                    const key = await this.keyManager.requestKey(normalizedAccount, type);
+                    const key = await this.keyManager.getKeyIfAvailable(normalizedAccount, type);
                     if (key) {
                         privateKeys[type] = key;
                         availableTypes.push(type);
+                        // Derive public key as fallback if chain data was missing
                         try {
                             const pub = PrivateKey.fromString(key).createPublic().toString();
                             if (!publicKeys[type]) publicKeys[type] = pub;
@@ -5639,6 +5619,60 @@ class KeyManager {
      * Use requestKey() (async) which properly decrypts in-memory encrypted keys.
      */
     getKeySync(_account, _type) {
+        return null;
+    }
+
+    /**
+     * Silently retrieve a key if it is already available in session cache or
+     * unlocked vault. NEVER triggers PIN dialog or key-entry events.
+     * Returns null if the key is not currently accessible.
+     *
+     * @param {string} account
+     * @param {string} type - 'posting' | 'active' | 'owner' | 'memo'
+     * @returns {Promise<string|null>} The private key WIF string or null
+     */
+    async getKeyIfAvailable(account, type) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return null;
+
+        // Check PIN expiry
+        if (this.pinVerificationTime > 0 && !this.isPINValid()) {
+            return null;
+        }
+
+        // 1. Try session cache
+        const sessionEntry = this.sessionKeys.get(`${normalizedAccount}_${type}`);
+        if (sessionEntry) {
+            const decrypted = await this._decryptFromCache(sessionEntry);
+            if (decrypted) return decrypted;
+            // Decryption failed (CryptoKey gone) — clear stale entry
+            this.sessionKeys.delete(`${normalizedAccount}_${type}`);
+        }
+
+        // 2. Try vault master keys (only if PIN is still valid — no prompting)
+        if (this.vaultMaster && this.isPINValid()) {
+            try {
+                const master = await this.vaultMaster.get(normalizedAccount);
+                if (master && master.derived_keys && master.derived_keys[type]) {
+                    await this.cacheKeys(normalizedAccount, master.derived_keys);
+                    return master.derived_keys[type];
+                }
+            } catch (e) {}
+        }
+
+        // 3. Try vault individual keys
+        if (this.vaultIndividual && this.isPINValid()) {
+            try {
+                const indKey = await this.vaultIndividual.get(`${normalizedAccount}_${type}`);
+                if (indKey && indKey.key) {
+                    const stored = await this._encryptForCache(indKey.key);
+                    this.sessionKeys.set(`${normalizedAccount}_${type}`, stored);
+                    return indKey.key;
+                }
+            } catch (e) {}
+        }
+
+        // Key not available — return null, do NOT prompt
         return null;
     }
 
