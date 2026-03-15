@@ -213,7 +213,7 @@ import pixaContentInit, {
     extractPlainText as wasmExtractPlainText,
     summarizeContent as wasmSummarizeContent,
     sanitizeUsername as wasmSanitizeUsername,
-} from '@pixagram/sanitizer';
+} from './sanitizer.js';
 import {
     Client,
     PrivateKey,
@@ -377,6 +377,30 @@ function translateAssetToChain(assetStr) {
     if (!parsed) return assetStr;
     const chainSymbol = ASSET_MAP_TO_CHAIN[parsed.symbol] ?? parsed.symbol;
     return formatAssetString(parsed.amount, chainSymbol);
+}
+
+// ============================================
+// CONTENT TYPE DETECTION
+// ============================================
+
+/**
+ * Detect whether a post body is a pixel art post (pure base64 image)
+ * or a blog post (HTML/markdown content).
+ *
+ * Pixel art posts: body is a raw `data:image/...;base64,...` data URI.
+ * Blog posts: body is HTML or markdown text.
+ *
+ * @param {string} body - Raw post body from chain
+ * @returns {'pixel_art'|'blog'}
+ */
+function detectContentType(body) {
+    if (!body || typeof body !== 'string') return 'blog';
+    const trimmed = body.trim();
+    // Pure base64 image data URI — pixel art post
+    if (trimmed.startsWith('data:image/') && !trimmed.includes('<') && !trimmed.includes('\n')) {
+        return 'pixel_art';
+    }
+    return 'blog';
 }
 
 // ============================================
@@ -1602,14 +1626,13 @@ export class PixaProxyAPI {
         }
 
         // Legacy fallback — build field-by-field, NO spread of raw data.
-        // Dangerous fields keep their names but store sanitized JSON strings.
+        // safeJson returns a sanitized JSON string. Parse for field access, store string directly.
         const safePostingMetaStr = this.contentSanitizer.safeJson(account.posting_json_metadata || '{}');
         const safeJsonMetaStr    = this.contentSanitizer.safeJson(account.json_metadata || '{}');
-        let parsedPostingMeta = {};
-        let parsedJsonMeta    = {};
-        try { parsedPostingMeta = JSON.parse(safePostingMetaStr); } catch (e) {}
-        try { parsedJsonMeta    = JSON.parse(safeJsonMetaStr); } catch (e) {}
-        const profile = { ...(parsedJsonMeta.profile || {}), ...(parsedPostingMeta.profile || {}) };
+        let postingMeta = {}, jsonMeta = {};
+        try { postingMeta = JSON.parse(safePostingMetaStr); } catch (e) {}
+        try { jsonMeta    = JSON.parse(safeJsonMetaStr); } catch (e) {}
+        const profile = { ...(jsonMeta.profile || {}), ...(postingMeta.profile || {}) };
 
         return {
             _entity_type: 'account',
@@ -1624,7 +1647,6 @@ export class PixaProxyAPI {
                 cover_image: profile.cover_image || null,
             },
             _links: [],
-            // SECURITY FIX (v3.5.2): Apply validators to legacy path
             name: this.contentSanitizer.sanitizeUsername(account.name) || '',
             id: VALIDATORS.safe_number(account.id) ?? 0,
             json_metadata:         safeJsonMetaStr,
@@ -1667,17 +1689,29 @@ export class PixaProxyAPI {
         }
 
         // Legacy fallback — build field-by-field, NO spread of raw data.
+        const contentType = detectContentType(post.body);
         const processed = this.contentSanitizer.renderPost(post.body || '', renderOptions);
         const safeMetaStr = this.contentSanitizer.safeJson(post.json_metadata || '{}');
         let meta = {};
         try { meta = JSON.parse(safeMetaStr); } catch (e) {}
+
+        const rawDesc = typeof meta.description === 'string' ? meta.description : '';
+        const descriptionHtml = rawDesc
+            ? this.contentSanitizer.renderDescription(rawDesc)
+            : '';
+        const summary = contentType === 'pixel_art'
+            ? this.contentSanitizer.extractPlainText(rawDesc).slice(0, 500)
+            : this.contentSanitizer.extractPlainText(post.body || '').slice(0, 500);
+
         return {
             _entity_type: 'post',
+            _content_type: contentType,
             _sanitized: true,
             _stored_at: Date.now(),
             _images: processed.images || [],
             _links: processed.links || [],
-            _summary: this.contentSanitizer.extractPlainText(post.body || '').slice(0, 500),
+            _summary: summary,
+            _description_html: descriptionHtml,
             _word_count: processed.wordCount || 0,
             id: post.id || 0,
             author: post.author || '',
@@ -1734,8 +1768,6 @@ export class PixaProxyAPI {
         // Legacy fallback — build field-by-field, NO spread of raw data.
         const processed = this.contentSanitizer.renderComment(comment.body || '', renderOptions);
         const safeMetaStr = this.contentSanitizer.safeJson(comment.json_metadata || '{}');
-        let meta = {};
-        try { meta = JSON.parse(safeMetaStr); } catch (e) {}
         return {
             _entity_type: 'comment',
             _sanitized: true,
@@ -1812,6 +1844,96 @@ export class PixaProxyAPI {
      */
     sanitizeUsername(rawUsername) {
         return this.contentSanitizer.sanitizeUsername(rawUsername);
+    }
+
+    // ─────────────────────────────────────────────
+    // Sanitization Primitives — for dangerouslySetInnerHTML
+    // ─────────────────────────────────────────────
+    // Every string rendered via dangerouslySetInnerHTML MUST pass through
+    // one of these methods first. Each uses a different WASM tier with
+    // different tag/attribute allowlists.
+
+    /**
+     * Sanitize HTML for post-level rendering (full markdown).
+     * Allows: headings, tables, images, figures, lists, blockquotes, code,
+     *         links, inline formatting, details/summary.
+     * Strips: script, style, iframe, video, audio, form, embed, object.
+     *
+     * Use for: post body content rendered via dangerouslySetInnerHTML.
+     *
+     * @param {string} html - Raw HTML or markdown text
+     * @returns {string} Sanitized HTML safe for innerHTML
+     */
+    sanitizePostHTML(html) {
+        if (!html) return '';
+        const result = this.contentSanitizer.renderPost(html);
+        return result.html || '';
+    }
+
+    /**
+     * Sanitize HTML for comment-level rendering.
+     * Allows: lists, blockquotes, code, links, inline formatting.
+     * Strips: headings, tables, images, iframes, and everything post-only.
+     *
+     * Use for: comment bodies rendered via dangerouslySetInnerHTML.
+     *
+     * @param {string} html - Raw HTML or markdown text
+     * @returns {string} Sanitized HTML safe for innerHTML
+     */
+    sanitizeCommentHTML(html) {
+        if (!html) return '';
+        const result = this.contentSanitizer.renderComment(html);
+        return result.html || '';
+    }
+
+    /**
+     * Sanitize HTML for memo-level rendering (inline only).
+     * Allows: bold, italic, @mentions, #hashtags.
+     * Strips: everything else (no lists, no blocks, no links, no images).
+     *
+     * Use for: transaction memos rendered via dangerouslySetInnerHTML.
+     *
+     * @param {string} html - Raw HTML or markdown text
+     * @returns {string} Sanitized HTML safe for innerHTML
+     */
+    sanitizeMemoHTML(html) {
+        if (!html) return '';
+        const result = this.contentSanitizer.renderMemo(html);
+        return result.html || '';
+    }
+
+    /**
+     * Sanitize a description or any user-supplied text for safe innerHTML rendering.
+     * Uses comment-tier: lists, blockquotes, code, links, inline formatting.
+     * No images, no headings, no tables.
+     *
+     * Use for: json_metadata.description, profile "about" text, or any
+     * user-supplied text field displayed via dangerouslySetInnerHTML.
+     *
+     * @param {string} text - Raw text, HTML, or markdown
+     * @returns {string} Sanitized HTML safe for innerHTML
+     */
+    sanitizeDescription(text) {
+        if (!text) return '';
+        return this.contentSanitizer.renderDescription(text);
+    }
+
+    /**
+     * Strip ALL HTML and return plain text only.
+     * Use for: generating summaries, search indexing, notifications,
+     * or anywhere markup is not wanted.
+     *
+     * @param {string} text - Raw HTML, markdown, or text
+     * @param {number} [maxLen=0] - Maximum length (0 = unlimited)
+     * @returns {string} Plain text with all HTML removed
+     */
+    sanitizeText(text, maxLen = 0) {
+        if (!text) return '';
+        const plain = this.contentSanitizer.extractPlainText(text);
+        if (maxLen > 0 && plain.length > maxLen) {
+            return plain.slice(0, maxLen);
+        }
+        return plain;
     }
 
     /**
@@ -1928,11 +2050,15 @@ class TagsAPI {
         if (this.proxy.sanitizationPipeline && this.proxy.entityStore && this.proxy.queryCache) {
             const ids = [];
             for (const raw of rawResults) {
-                const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
-                if (entity) {
-                    const type = entity._entity_type === 'post' ? 'posts' : 'comments';
-                    await this.proxy.entityStore.upsert(type, entity);
-                    ids.push(entity._entity_id);
+                try {
+                    const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
+                    if (entity) {
+                        const type = entity._entity_type === 'post' ? 'posts' : 'comments';
+                        await this.proxy.entityStore.upsert(type, entity);
+                        ids.push(entity._entity_id);
+                    }
+                } catch (e) {
+                    console.warn('[TagsAPI] Failed to sanitize entity, skipping:', raw?.author, raw?.permlink, e.message || e);
                 }
             }
             // Store query → ID[] mapping
@@ -2093,10 +2219,14 @@ class AccountsAPI {
             const sanitized = [];
             for (const raw of rawAccounts) {
                 if (!raw) continue;
-                const entity = this.proxy.sanitizationPipeline.sanitizeAccount(raw);
-                if (entity) {
-                    await this.proxy.entityStore.upsert('accounts', entity);
-                    sanitized.push(entity);
+                try {
+                    const entity = this.proxy.sanitizationPipeline.sanitizeAccount(raw);
+                    if (entity) {
+                        await this.proxy.entityStore.upsert('accounts', entity);
+                        sanitized.push(entity);
+                    }
+                } catch (e) {
+                    console.warn('[AccountsAPI] Failed to sanitize account, skipping:', raw?.name, e.message || e);
                 }
             }
             return sanitized;
@@ -2310,11 +2440,16 @@ class ContentAPI {
 
         // Sanitize and store
         if (this.proxy.sanitizationPipeline && this.proxy.entityStore) {
-            const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
-            if (entity) {
-                const type = entity._entity_type === 'post' ? 'posts' : 'comments';
-                await this.proxy.entityStore.upsert(type, entity);
-                return entity;
+            try {
+                const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
+                if (entity) {
+                    const type = entity._entity_type === 'post' ? 'posts' : 'comments';
+                    await this.proxy.entityStore.upsert(type, entity);
+                    return entity;
+                }
+            } catch (e) {
+                console.warn('[ContentAPI] Failed to sanitize content:', raw?.author, raw?.permlink, e.message || e);
+                return null;
             }
         }
 
@@ -2352,10 +2487,14 @@ class ContentAPI {
         if (this.proxy.sanitizationPipeline && this.proxy.entityStore && this.proxy.queryCache) {
             const ids = [];
             for (const raw of rawReplies) {
-                const entity = this.proxy.sanitizationPipeline.sanitizeComment(raw);
-                if (entity) {
-                    await this.proxy.entityStore.upsert('comments', entity);
-                    ids.push(entity._entity_id);
+                try {
+                    const entity = this.proxy.sanitizationPipeline.sanitizeComment(raw);
+                    if (entity) {
+                        await this.proxy.entityStore.upsert('comments', entity);
+                        ids.push(entity._entity_id);
+                    }
+                } catch (e) {
+                    console.warn('[ContentAPI] Failed to sanitize reply, skipping:', raw?.author, raw?.permlink, e.message || e);
                 }
             }
             await this.proxy.queryCache.store(queryKey, ids, 'comments');
@@ -2376,11 +2515,15 @@ class ContentAPI {
             if (rawResults && this.proxy.sanitizationPipeline && this.proxy.entityStore) {
                 const sanitized = [];
                 for (const raw of rawResults) {
-                    const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
-                    if (entity) {
-                        const type = entity._entity_type === 'post' ? 'posts' : 'comments';
-                        await this.proxy.entityStore.upsert(type, entity);
-                        sanitized.push(entity);
+                    try {
+                        const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
+                        if (entity) {
+                            const type = entity._entity_type === 'post' ? 'posts' : 'comments';
+                            await this.proxy.entityStore.upsert(type, entity);
+                            sanitized.push(entity);
+                        }
+                    } catch (e) {
+                        console.warn('[ContentAPI] Failed to sanitize entity, skipping:', raw?.author, raw?.permlink, e.message || e);
                     }
                 }
                 return sanitized;
@@ -2412,10 +2555,14 @@ class ContentAPI {
             if (rawResults && this.proxy.sanitizationPipeline && this.proxy.entityStore) {
                 const sanitized = [];
                 for (const raw of rawResults) {
-                    const entity = this.proxy.sanitizationPipeline.sanitizeComment(raw);
-                    if (entity) {
-                        await this.proxy.entityStore.upsert('comments', entity);
-                        sanitized.push(entity);
+                    try {
+                        const entity = this.proxy.sanitizationPipeline.sanitizeComment(raw);
+                        if (entity) {
+                            await this.proxy.entityStore.upsert('comments', entity);
+                            sanitized.push(entity);
+                        }
+                    } catch (e) {
+                        console.warn('[ContentAPI] Failed to sanitize reply, skipping:', raw?.author, raw?.permlink, e.message || e);
                     }
                 }
                 return sanitized;
@@ -2481,11 +2628,15 @@ class ContentAPI {
         if (this.proxy.sanitizationPipeline && this.proxy.entityStore && this.proxy.queryCache) {
             const ids = [];
             for (const raw of rawResults) {
-                const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
-                if (entity) {
-                    const storeType = entity._entity_type === 'post' ? 'posts' : 'comments';
-                    await this.proxy.entityStore.upsert(storeType, entity);
-                    ids.push(entity._entity_id);
+                try {
+                    const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
+                    if (entity) {
+                        const storeType = entity._entity_type === 'post' ? 'posts' : 'comments';
+                        await this.proxy.entityStore.upsert(storeType, entity);
+                        ids.push(entity._entity_id);
+                    }
+                } catch (e) {
+                    console.warn('[ContentAPI] Failed to sanitize entity, skipping:', raw?.author, raw?.permlink, e.message || e);
                 }
             }
             await this.proxy.queryCache.store(queryKey, ids, entityType);
@@ -2767,6 +2918,11 @@ class BroadcastAPI {
             jsonMetadata: accountData.json_metadata,
             postingJsonMetadata: newPostingMeta
         });
+
+        // Invalidate stale cached account so next getAccounts() fetches fresh data
+        if (this.proxy.entityStore) {
+            await this.proxy.entityStore.invalidate('accounts', normalizedAccount);
+        }
 
         if (this.proxy.eventEmitter) {
             this.proxy.eventEmitter.emit('profile_updated', { account: normalizedAccount, profile: newPostingMeta.profile });
@@ -3918,11 +4074,15 @@ class CommunitiesAPI {
         if (this.proxy.sanitizationPipeline && this.proxy.entityStore && this.proxy.queryCache) {
             const ids = [];
             for (const raw of rawResults) {
-                const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
-                if (entity) {
-                    const type = entity._entity_type === 'post' ? 'posts' : 'comments';
-                    await this.proxy.entityStore.upsert(type, entity);
-                    ids.push(entity._entity_id);
+                try {
+                    const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
+                    if (entity) {
+                        const type = entity._entity_type === 'post' ? 'posts' : 'comments';
+                        await this.proxy.entityStore.upsert(type, entity);
+                        ids.push(entity._entity_id);
+                    }
+                } catch (e) {
+                    console.warn('[CommunitiesAPI] Failed to sanitize entity, skipping:', raw?.author, raw?.permlink, e.message || e);
                 }
             }
             await this.proxy.queryCache.store(queryKey, ids, 'posts');
@@ -3976,11 +4136,15 @@ class CommunitiesAPI {
         if (this.proxy.sanitizationPipeline && this.proxy.entityStore && this.proxy.queryCache) {
             const ids = [];
             for (const raw of rawResults) {
-                const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
-                if (entity) {
-                    const storeType = entity._entity_type === 'post' ? 'posts' : 'comments';
-                    await this.proxy.entityStore.upsert(storeType, entity);
-                    ids.push(entity._entity_id);
+                try {
+                    const entity = this.proxy.sanitizationPipeline.sanitizeContent(raw);
+                    if (entity) {
+                        const storeType = entity._entity_type === 'post' ? 'posts' : 'comments';
+                        await this.proxy.entityStore.upsert(storeType, entity);
+                        ids.push(entity._entity_id);
+                    }
+                } catch (e) {
+                    console.warn('[CommunitiesAPI] Failed to sanitize entity, skipping:', raw?.author, raw?.permlink, e.message || e);
                 }
             }
             await this.proxy.queryCache.store(queryKey, ids, entityType);
@@ -4181,9 +4345,8 @@ class SanitizationPipeline {
         const safePostingMetaStr = this.sanitizer.safeJson(rawPostingMeta);
         const safeJsonMetaStr    = this.sanitizer.safeJson(rawJsonMeta);
 
-        // Parse the safe strings locally for field extraction only
-        let postingMeta = {};
-        let jsonMeta    = {};
+        // Parse for field extraction only
+        let postingMeta = {}, jsonMeta = {};
         try { postingMeta = JSON.parse(safePostingMetaStr); } catch (e) {}
         try { jsonMeta    = JSON.parse(safeJsonMetaStr); } catch (e) {}
 
@@ -4311,28 +4474,48 @@ class SanitizationPipeline {
 
         const entityId = `${author}_${permlink}`;
 
-        // DANGEROUS: body — sanitize through WASM, store only sanitized HTML
-        const rendered = this.sanitizer.renderPost(raw.body || '', renderOptions);
-
-        // DANGEROUS: json_metadata — sanitize through WASM, store as safe string
+        // DANGEROUS: json_metadata — sanitize through WASM, returns safe JSON string
         const safeMetaStr = this.sanitizer.safeJson(raw.json_metadata || '{}');
         let meta = {};
         try { meta = JSON.parse(safeMetaStr); } catch (e) {}
+
+        // ── Content type detection ──────────────────────────────────────
+        const contentType = detectContentType(raw.body);
+
+        let rendered, summary, descriptionHtml;
+
+        if (contentType === 'pixel_art') {
+            rendered = this.sanitizer.renderPost(raw.body || '', renderOptions);
+            const rawDesc = typeof meta.description === 'string' ? meta.description : '';
+            descriptionHtml = rawDesc
+                ? this.sanitizer.renderDescription(rawDesc)
+                : '';
+            summary = this.sanitizer.extractPlainText(rawDesc).slice(0, 500);
+        } else {
+            rendered = this.sanitizer.renderPost(raw.body || '', renderOptions);
+            const rawDesc = typeof meta.description === 'string' ? meta.description : '';
+            descriptionHtml = rawDesc
+                ? this.sanitizer.renderDescription(rawDesc)
+                : '';
+            summary = this.sanitizer.extractPlainText(raw.body || '').slice(0, 500);
+        }
 
         // Build entity FIELD BY FIELD — no { ...raw } spread.
         return {
             _entity_id:   entityId,
             _entity_type: 'post',
+            _content_type: contentType,
             _sanitized:   true,
             _stored_at:   Date.now(),
 
             // Enrichment
-            _images:     rendered.images || [],
-            _links:      rendered.links || [],
-            _summary:    this.sanitizer.extractPlainText(raw.body || '').slice(0, 500),
-            _tags:       meta.tags || [],
-            _word_count: rendered.wordCount || 0,
-            _app:        typeof meta.app === 'string' ? meta.app : '',
+            _images:           rendered.images || [],
+            _links:            rendered.links || [],
+            _summary:          summary,
+            _description_html: descriptionHtml,
+            _tags:             meta.tags || [],
+            _word_count:       rendered.wordCount || 0,
+            _app:              typeof meta.app === 'string' ? meta.app : '',
 
             // Identity
             id:              VALIDATORS.safe_number(raw.id) ?? 0,
@@ -4423,10 +4606,8 @@ class SanitizationPipeline {
         // DANGEROUS: body
         const rendered = this.sanitizer.renderComment(raw.body || '', renderOptions);
 
-        // DANGEROUS: json_metadata
+        // DANGEROUS: json_metadata — sanitize through WASM, returns safe object
         const safeMetaStr = this.sanitizer.safeJson(raw.json_metadata || '{}');
-        let meta = {};
-        try { meta = JSON.parse(safeMetaStr); } catch (e) {}
 
         return {
             _entity_id:   entityId,
@@ -4768,7 +4949,7 @@ class ContentSanitizer {
 
         /** @type {object} Default sanitize options (v0.2 SanitizeOptions) */
         this.defaultOptions = {
-            internal_domains: ['pixa.pics'],
+            internal_domains: ['pixagram.io'],
             max_body_length: 500000,
             max_image_count: 0,
         };
@@ -4785,14 +4966,10 @@ class ContentSanitizer {
 
         this._initPromise = (async () => {
             try {
-                // pixaContentInit is the default export — call it to boot the WASM
-                if (wasmPath) {
-                    await pixaContentInit(wasmPath);
-                } else {
-                    await pixaContentInit();
-                }
+                // pixaContentInit is the default export — no-op for JS sanitizer
+                await pixaContentInit();
                 this.ready = true;
-                console.log('[ContentSanitizer] pixa-content WASM engine initialized');
+                console.log('[ContentSanitizer] pixa-content JS engine initialized');
             } catch (e) {
                 console.error('[ContentSanitizer] Failed to initialize pixa-content:', e);
                 this.ready = false;
@@ -4875,6 +5052,27 @@ class ContentSanitizer {
     }
 
     /**
+     * Sanitize a description or any user-supplied text for safe innerHTML rendering.
+     * Uses comment-tier (lists, blockquotes, code, links — no images, headings, tables).
+     * Returns just the sanitized HTML string.
+     *
+     * Use this for: json_metadata.description, profile about, or any text
+     * that will be rendered via dangerouslySetInnerHTML in the frontend.
+     *
+     * @param {string} text - Raw text/HTML/markdown
+     * @param {object} [options] - Override render options
+     * @returns {string} Sanitized HTML safe for innerHTML
+     */
+    renderDescription(text, options = {}) {
+        if (!text || typeof text !== 'string') return '';
+        this._requireReady('renderDescription');
+
+        const opts = { ...this.defaultOptions, ...options };
+        const result = wasmSanitizeComment(text, JSON.stringify(opts));
+        return result.html || '';
+    }
+
+    /**
      * Render a memo (bold, italic, @mentions, #hashtags only)
      * v0.2: New tier.
      * @param {string} body
@@ -4891,15 +5089,28 @@ class ContentSanitizer {
 
     /**
      * Sanitize a JSON string — all keys validated, strings stripped.
-     * Input: JSON string. Output: sanitized JSON string.
-     * v0.2: New primitive.
-     * @param {string} jsonStr
-     * @returns {string} Sanitized JSON string
+     * Input: JSON string or object. Output: sanitized JS object.
+     * WASM parses + sanitizes + returns a native object — no double parse.
+     * Callers use the object directly; JSON.stringify() when storing.
+     * @param {string|object} jsonStr
+     * @returns {object} Sanitized JS object (empty object on failure)
      */
     safeJson(jsonStr) {
         if (!jsonStr) return '{}';
         this._requireReady('safeJson');
-        return wasmSafeJson(jsonStr);
+        // RPC clients may return json_metadata as a pre-parsed object OR a string.
+        // WASM expects a string — stringify objects before passing through.
+        let input = jsonStr;
+        if (typeof input !== 'string') {
+            try { input = JSON.stringify(input); } catch (e) { return '{}'; }
+        }
+        try {
+            // wasmSafeJson returns a sanitized JSON string
+            return wasmSafeJson(input) || '{}';
+        } catch (e) {
+            console.warn('[ContentSanitizer] safeJson failed:', e.message || e);
+            return '{}';
+        }
     }
 
     /**
@@ -5862,8 +6073,9 @@ class SessionManager {
         if (!normalizedAccount) return false;
 
         const now = Date.now();
-        // SECURITY FIX (v3.5.2): Consistent timeout — no 7-day fallback
-        const timeout = this.config.SESSION_TIMEOUT || 30 * 60 * 1000;
+        // SECURITY FIX (v3.5.2): Consistent timeout — no fallback (fail-closed, same as createSession)
+        const timeout = this.config.SESSION_TIMEOUT;
+        if (!timeout || timeout <= 0) return false;
 
         try {
             await this.sessions.update(normalizedAccount, {
@@ -6032,7 +6244,8 @@ export {
     translateAssetFromChain,
     translateAssetToChain,
     parseAsset,
-    formatAssetString
+    formatAssetString,
+    detectContentType
 };
 
 // Re-export SDK utility helpers
