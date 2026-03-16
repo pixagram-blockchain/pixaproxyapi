@@ -1,7 +1,7 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 3.7.0
+ * @version 4.0.0
  *
  * API Groups and Methods:
  *
@@ -234,12 +234,17 @@ import {
 } from '@pixagram/dpixa';
 import EventEmitter from 'events';
 
+// PQ Vault loaded lazily — see _ensurePQVault()
+let _PQSecureVault = null;
+let _initPQVault = null;
+
 // ============================================
 // Configuration
 // ============================================
 
 const CONFIG = {
-    PBKDF2_ITERATIONS: 1000 * 1000,
+    ARGON2_MEMORY_KIB: 19456,
+    ARGON2_ITERATIONS: 2,
     CACHE_TTL: {
         posts: 60 * 1000,
         accounts: 24 * 60 * 60 * 1000,
@@ -284,7 +289,7 @@ const CONFIG = {
     DEFAULT_NODES: [
         'https://cors-header-proxy-with-api.omnibus-39a.workers.dev'
     ],
-    APP_NAME: 'pixagram/3.5.2',
+    APP_NAME: 'pixagram/4.0.0',
     PAGINATION_LIMIT: 20,
     CHAIN_ID: null,
     ADDRESS_PREFIX: 'PIX',
@@ -582,49 +587,6 @@ function bytesToHex(bytes) {
 }
 
 /**
- * PBKDF2 key derivation (browser-compatible)
- * @param {string} password
- * @param {string} salt - Hex string
- * @param {number} iterations
- * @param {number} keyLength - In bits
- * @returns {Promise<ArrayBuffer>}
- */
-async function pbkdf2Derive(password, salt, iterations, keyLength) {
-    if (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) {
-        const enc = new TextEncoder();
-        const keyMaterial = await window.crypto.subtle.importKey(
-            'raw',
-            enc.encode(password),
-            'PBKDF2',
-            false,
-            ['deriveBits']
-        );
-
-        const saltBuffer = new Uint8Array(salt.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-
-        return window.crypto.subtle.deriveBits(
-            {
-                name: 'PBKDF2',
-                salt: saltBuffer,
-                iterations: iterations,
-                hash: 'SHA-512'
-            },
-            keyMaterial,
-            keyLength
-        );
-    } else {
-        // Fallback for Node.js
-        const nodeCrypto = require('crypto');
-        return new Promise((resolve, reject) => {
-            nodeCrypto.pbkdf2(password, Buffer.from(salt, 'hex'), iterations, keyLength / 8, 'sha512', (err, key) => {
-                if (err) reject(err);
-                else resolve(key.buffer);
-            });
-        });
-    }
-}
-
-/**
  * Normalize account name
  * @param {string|object} account
  * @returns {string|null}
@@ -644,8 +606,10 @@ export class PixaProxyAPI {
     constructor() {
         this.lacerta = new LacertaDB();
         this.cacheDb = null;
-        this.vaultDb = null;
         this.settingsDb = null;
+
+        /** @type {PQSecureVault} Argon2id + ChaCha20-Poly1305 vault (replaces PBKDF2 + AES-GCM) */
+        this.pqVault = null;
 
         /** @type {Client} Single unified client for all API calls */
         this.client = null;
@@ -813,7 +777,15 @@ export class PixaProxyAPI {
             }
 
             this.initialized = true;
-            console.log('[PixaProxyAPI] Initialized successfully v3.5.2-patched');
+
+            // Attempt PQ Vault pre-load (non-fatal — will be retried in initializeVault)
+            try {
+                await this._ensurePQVault(config);
+            } catch (pqErr) {
+                console.warn('[PixaProxyAPI] PQ Vault pre-load deferred:', pqErr.message || pqErr);
+            }
+
+            console.log('[PixaProxyAPI] Initialized successfully v4.0.0');
             return this;
         } catch (error) {
             console.error('[PixaProxyAPI] Initialization failed:', error);
@@ -865,8 +837,8 @@ export class PixaProxyAPI {
 
     async hasVaultConfig() {
         try {
-            const saltCollection = await this.settingsDb.getCollection('vault_config');
-            const saltDoc = await saltCollection.get('vault_salt');
+            const configCollection = await this.settingsDb.getCollection('pq_vault_config');
+            const saltDoc = await configCollection.get('vault_salt');
             return !!saltDoc;
         } catch (e) {
             return false;
@@ -947,10 +919,59 @@ export class PixaProxyAPI {
         const account = this.sessionManager?.getCurrentAccountSync?.() ||
             await this.sessionManager?.getActiveAccount?.();
 
+        if (this.pqVault) this.pqVault.lock();
         if (this.sessionManager) await this.sessionManager.endSession();
         if (this.keyManager) await this.keyManager.clearAllSessions(true);
 
         this.eventEmitter.emit('session_ended', { account });
+    }
+
+    /**
+     * Lazy-load the PQ Secure Vault WASM module.
+     * Called automatically by initializeVault() and unlockWithPin().
+     *
+     * Uses dynamic import() so the app doesn't crash at module load time
+     * if pq-secure-vault.js dependencies aren't installed yet.
+     *
+     * @param {object} [config] - Optional config with skipAutoTune flag
+     * @returns {Promise<PQSecureVault>}
+     * @private
+     */
+    async _ensurePQVault(config = {}) {
+        if (this.pqVault) return this.pqVault;
+
+        // Dynamic import from local file
+        if (!_PQSecureVault || !_initPQVault) {
+            try {
+                const vaultMod = await import('./pq-secure-vault.js');
+                _PQSecureVault = vaultMod.PQSecureVault;
+                _initPQVault = vaultMod.initPQVault;
+            } catch (e) {
+                throw new PixaAPIError(
+                    'pq-secure-vault.js not found. Ensure the file exists and dependencies are installed: npm install hash-wasm @noble/ciphers @noble/hashes',
+                    'PQ_VAULT_NOT_INSTALLED'
+                );
+            }
+        }
+
+        // hash-wasm self-initializes; initPQVault runs a warm-up derivation
+        await _initPQVault();
+
+        this.pqVault = new _PQSecureVault({
+            memoryKib: this.config.ARGON2_MEMORY_KIB,
+            iterations: this.config.ARGON2_ITERATIONS,
+        });
+
+        if (!config.skipAutoTune) {
+            try {
+                const tuned = await this.pqVault.autoTuneParams(1500);
+                console.debug(`[PQVault] Auto-tuned: ${tuned.label} (${tuned.measuredMs}ms, ${tuned.memoryKib} KiB, t=${tuned.iterations})`);
+            } catch (e) {
+                console.warn('[PQVault] autoTune failed, using defaults:', e.message);
+            }
+        }
+
+        return this.pqVault;
     }
 
     async initializeVault(pin, options = {}) {
@@ -959,63 +980,61 @@ export class PixaProxyAPI {
         }
         if (options.pinTimeout) this.config.PIN_TIMEOUT = options.pinTimeout;
 
-        try {
-            const iterations = this.config.PBKDF2_ITERATIONS;
+        // Ensure WASM module is loaded
+        await this._ensurePQVault();
 
-            try { await this.settingsDb.createCollection('vault_config'); } catch (e) {}
-            const saltCollection = await this.settingsDb.getCollection('vault_config');
+        try {
+            // --- Salt + Argon2 params management ---
+            try { await this.settingsDb.createCollection('pq_vault_config'); } catch (e) {}
+            const configCollection = await this.settingsDb.getCollection('pq_vault_config');
 
             let existingSalt = null;
+            let storedMemoryKib = null;
+            let storedIterations = null;
             try {
-                const saltDoc = await saltCollection.get('vault_salt');
-                if (saltDoc && saltDoc.salt) existingSalt = saltDoc.salt;
+                const saltDoc = await configCollection.get('vault_salt');
+                if (saltDoc && saltDoc.salt) {
+                    existingSalt = saltDoc.salt;
+                    // Restore Argon2 params used when vault was created
+                    storedMemoryKib = saltDoc.argon2_memory_kib || null;
+                    storedIterations = saltDoc.argon2_iterations || null;
+                }
             } catch (e) {}
 
             if (!existingSalt) {
-                const saltBytes = getRandomBytes(64);
-                existingSalt = bytesToHex(saltBytes);
+                // Fresh vault — generate salt and persist current params
+                existingSalt = this.pqVault.generateSalt(32);
+                const saltRecord = {
+                    salt: existingSalt,
+                    version: 1,
+                    argon2_memory_kib: this.pqVault.memoryKib,
+                    argon2_iterations: this.pqVault.iterations,
+                    created_at: Date.now()
+                };
                 try {
-                    await saltCollection.add({ salt: existingSalt, created_at: Date.now() }, { id: 'vault_salt' });
+                    await configCollection.add(saltRecord, { id: 'vault_salt' });
                 } catch (e) {
-                    await saltCollection.update('vault_salt', { salt: existingSalt, created_at: Date.now() });
+                    await configCollection.update('vault_salt', saltRecord);
                 }
+            } else if (storedMemoryKib && storedIterations) {
+                // Existing vault — use the params it was created with
+                this.pqVault.memoryKib = storedMemoryKib;
+                this.pqVault.iterations = storedIterations;
             }
 
-            // FIX: When doing a fresh vault creation (not fastMode/unlock),
-            // clear any stale vault database and encryption metadata from
-            // a previous session. Without this, _initializeEncryption finds
-            // old wrapped-key metadata in localStorage and tries to decrypt
-            // it with the new PIN, which fails with "Invalid PIN or corrupted key data".
-            if (!options.fastMode && !this.vaultInitialized) {
-                try {
-                    await this.lacerta.dropDatabase('pixa_vault');
-                } catch (dropErr) {
-                    // Ignore - database may not exist yet
-                }
-            }
+            // --- Derive encryption key + cache in PQ vault session ---
+            await this.pqVault.unlockSession(pin, existingSalt);
 
-            this.vaultDb = await this.lacerta.getSecureDatabase(
-                'pixa_vault', pin, existingSalt,
-                {
-                    iterations: iterations,
-                    hashAlgorithm: 'SHA-512',
-                    keyLength: 256,
-                    saltLength: 64,
-                    onProgress: options.onProgress || null
-                }
-            );
+            // --- Setup sealed-keys collection ---
+            try { await this.settingsDb.createCollection('sealed_keys'); } catch (e) {}
 
-            await this.setupVaultCollections();
-            await this.keyManager.setVault(this.vaultDb);
-
-            // Store PIN verification token (HMAC of known plaintext)
-            // Used by unlockWithPin to detect wrong PINs without reading vault data
+            // --- PIN verification hash (Argon2id → HKDF → BLAKE3, stored plaintext) ---
             try {
-                const verifyHash = await this._derivePinVerifyHash(pin, existingSalt);
+                const verifyHash = await this.pqVault.generateVerifyHash(pin, existingSalt);
                 try {
-                    await saltCollection.add({ hash: verifyHash, created_at: Date.now() }, { id: 'pin_verify' });
+                    await configCollection.add({ hash: verifyHash, algorithm: 'argon2id+blake3', created_at: Date.now() }, { id: 'pin_verify' });
                 } catch (e) {
-                    await saltCollection.update('pin_verify', { hash: verifyHash, updated_at: Date.now() });
+                    await configCollection.update('pin_verify', { hash: verifyHash, algorithm: 'argon2id+blake3', updated_at: Date.now() });
                 }
             } catch (e) {
                 console.warn('[initializeVault] Could not store PIN verify token:', e);
@@ -1026,26 +1045,26 @@ export class PixaProxyAPI {
             this.keyManager.resetPinTimer();
             this.vaultInitialized = true;
 
-            // Migrate any existing in-memory or unencrypted keys into the vault.
-            // This covers the case where the user did quickLogin first (keys in
-            // unencrypted store / sessionKeys) and then set up a vault later.
-            // SKIP in fastMode — fastMode is used by unlockWithPin to open an
-            // existing vault; migration there is handled separately to avoid
-            // double-writes and TurboSerial deserialization errors in LacertaDB's
-            // encrypted vault update path.
+            // Seal any existing in-memory or unencrypted keys into PQ vault.
+            // SKIP in fastMode — used by unlockWithPin to open an existing vault.
             if (!options.fastMode) {
                 const activeAccount = this.keyManager.activeAccount ||
                     (this.sessionManager && await this.sessionManager.getActiveAccount());
                 if (activeAccount) {
                     try {
-                        await this.keyManager.migrateKeysToVault(activeAccount);
+                        await this._sealKeysToVault(activeAccount, pin, existingSalt);
                     } catch (migrationErr) {
-                        console.warn('[initializeVault] Key migration warning:', migrationErr.message);
+                        console.warn('[initializeVault] Key sealing warning:', migrationErr.message);
                     }
                 }
             }
 
-            this.eventEmitter.emit('vault_initialized', { timestamp: Date.now() });
+            this.eventEmitter.emit('vault_initialized', {
+                timestamp: Date.now(),
+                algorithm: 'argon2id+chacha20poly1305',
+                memoryKib: this.pqVault.memoryKib,
+                iterations: this.pqVault.iterations,
+            });
             return true;
         } catch (e) {
             throw new PixaAPIError('Failed to initialize vault: ' + e.message, 'VAULT_INIT_FAILED');
@@ -1055,43 +1074,15 @@ export class PixaProxyAPI {
     isVaultInitialized() { return this.vaultInitialized; }
 
     /**
-     * Derive a verification hash from PIN + salt using PBKDF2.
-     * This is a SEPARATE derivation from the vault encryption key
-     * (different purpose string) so it doesn't leak the vault key.
+     * Derive a verification hash from PIN + salt.
+     * v4.0: Argon2id → HKDF("verify") → BLAKE3 (via pixa-vault WASM).
+     * Domain-separated from encryption key — cannot be reversed to derive it.
      * @param {string} pin
      * @param {string} salt - hex-encoded salt
-     * @returns {Promise<string>} base64-encoded verification hash
-     */
-    /**
-     * Derive a verification hash from PIN + salt using PBKDF2.
-     * SECURITY FIX (v3.5.2): Uses explicit binary domain separation (0x02 suffix)
-     * and SHA-512 (matching vault derivation algorithm) instead of string concat
-     * with SHA-256. The 0x02 purpose byte ensures this derivation can never collide
-     * with the vault encryption key (which uses the raw salt, implicitly purpose 0x01).
+     * @returns {string} hex-encoded BLAKE3 verification hash
      */
     async _derivePinVerifyHash(pin, salt) {
-        const encoder = new TextEncoder();
-        const keyMaterial = await crypto.subtle.importKey(
-            'raw', encoder.encode(pin),
-            { name: 'PBKDF2' }, false, ['deriveBits']
-        );
-        // Binary domain separation: append purpose byte 0x02 to the salt bytes
-        const saltBytes = new Uint8Array(salt.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-        const purposeSalt = new Uint8Array(saltBytes.length + 1);
-        purposeSalt.set(saltBytes);
-        purposeSalt[saltBytes.length] = 0x02; // Purpose: pin_verify
-
-        const bits = await crypto.subtle.deriveBits(
-            {
-                name: 'PBKDF2',
-                salt: purposeSalt,
-                iterations: this.config.PBKDF2_ITERATIONS,
-                hash: 'SHA-512'
-            },
-            keyMaterial,
-            256
-        );
-        return btoa(String.fromCharCode(...new Uint8Array(bits)));
+        return this.pqVault.generateVerifyHash(pin, salt);
     }
 
     async unlockWithPin(pin, options = {}) {
@@ -1112,6 +1103,13 @@ export class PixaProxyAPI {
             return { success: false, error: 'PIN too short', code: 'PIN_TOO_SHORT' };
         }
 
+        // Ensure WASM module is loaded
+        try {
+            await this._ensurePQVault();
+        } catch (e) {
+            return { success: false, error: e.message, code: e.code || 'PQ_VAULT_LOAD_FAILED' };
+        }
+
         try {
             // SECURITY FIX (v3.5.2): PIN attempt rate limiting
             if (this.keyManager._pinLockoutUntil > Date.now()) {
@@ -1128,90 +1126,41 @@ export class PixaProxyAPI {
                 try {
                     await this.initializeVault(pin, { fastMode: true });
                 } catch (e) {
+                    this.keyManager._recordFailedPinAttempt();
                     return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
                 }
             } else {
-                // Vault already initialized — verify the PIN before accepting it
+                // Vault already initialized — verify the PIN via stored BLAKE3 hash
                 try {
-                    const saltCollection = await this.settingsDb.getCollection('vault_config');
-                    const saltDoc = await saltCollection.get('vault_salt');
+                    const configCollection = await this.settingsDb.getCollection('pq_vault_config');
+                    const saltDoc = await configCollection.get('vault_salt');
 
                     if (!saltDoc || !saltDoc.salt) {
                         return { success: false, error: 'Vault configuration missing', code: 'VAULT_CONFIG_MISSING' };
                     }
 
-                    // Try stored verification hash first (fast path)
-                    let pinValid = false;
+                    // Restore Argon2 params used when vault was created
+                    if (saltDoc.argon2_memory_kib && saltDoc.argon2_iterations) {
+                        this.pqVault.memoryKib = saltDoc.argon2_memory_kib;
+                        this.pqVault.iterations = saltDoc.argon2_iterations;
+                    }
+
+                    // Verify PIN via Argon2id → HKDF("verify") → BLAKE3 (constant-time compare)
                     try {
-                        const verifyDoc = await saltCollection.get('pin_verify');
+                        const verifyDoc = await configCollection.get('pin_verify');
                         if (verifyDoc && verifyDoc.hash) {
-                            const enteredHash = await this._derivePinVerifyHash(pin, saltDoc.salt);
-                            if (enteredHash !== verifyDoc.hash) {
+                            const valid = await this.pqVault.verifyPin(pin, saltDoc.salt, verifyDoc.hash);
+                            if (!valid) {
+                                this.keyManager._recordFailedPinAttempt();
                                 return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
                             }
-                            pinValid = true;
                         }
                     } catch (e) {
-                        // pin_verify doc doesn't exist (old vault) — fall through to vault-read verification
+                        // No pin_verify doc — fall through to unseal-based verification
                     }
 
-                    if (!pinValid) {
-                        // Old vault without verify token: open vault with entered PIN and try to read
-                        // If wrong PIN → encrypted data won't decrypt → reads will fail or return null
-                        try {
-                            const testVault = await this.lacerta.getSecureDatabase(
-                                'pixa_vault', pin, saltDoc.salt,
-                                { iterations: this.config.PBKDF2_ITERATIONS, hashAlgorithm: 'SHA-512', keyLength: 256, saltLength: 64 }
-                            );
-                            // Try to actually read data — wrong key won't decrypt
-                            const testCollection = await testVault.getCollection('master_keys');
-                            const testRead = await testCollection.get(normalizedAccount);
-                            // testRead MUST be non-null with actual keys — if null, the PIN
-                            // decrypted to garbage or the wrong encryption context was used.
-                            // Lacerta may not throw on wrong PIN; it just returns empty/null.
-                            if (!testRead || !testRead.derived_keys) {
-                                // No master keys found — also try individual keys before rejecting.
-                                // User might have logged in with individual key, not master.
-                                try {
-                                    const testIndCollection = await testVault.getCollection('individual_keys');
-                                    const testIndRead = await testIndCollection.get(`${normalizedAccount}_posting`);
-                                    if (!testIndRead || !testIndRead.key) {
-                                        // Neither master nor individual keys found → wrong PIN
-                                        return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
-                                    }
-                                } catch (indErr) {
-                                    return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
-                                }
-                            }
-                            pinValid = true;
-
-                            // Do NOT backfill pin_verify from the fallback path — the PIN
-                            // was only weakly verified. pin_verify will be stored on the
-                            // next full initializeVault call.
-                        } catch (e) {
-                            return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
-                        }
-                    }
-
-                    // PIN verified — ALWAYS refresh vault handles to ensure they're
-                    // using the correct encryption context. Stale handles from the
-                    // original login may have been garbage-collected or may point to
-                    // a different encryption context after tab sleep/wake.
-                    try {
-                        await this.keyManager.setVault(this.vaultDb);
-                    } catch (e) {
-                        // vaultDb handle may be stale; re-open with verified PIN
-                        try {
-                            this.vaultDb = await this.lacerta.getSecureDatabase(
-                                'pixa_vault', pin, saltDoc.salt,
-                                { iterations: this.config.PBKDF2_ITERATIONS, hashAlgorithm: 'SHA-512', keyLength: 256, saltLength: 64 }
-                            );
-                            await this.setupVaultCollections();
-                            await this.keyManager.setVault(this.vaultDb);
-                        } catch (e2) {
-                            return { success: false, error: 'Vault access failed', code: 'VAULT_STALE' };
-                        }
-                    }
+                    // Derive encryption key + unlock PQ vault session
+                    await this.pqVault.unlockSession(pin, saltDoc.salt);
                 } catch (e) {
                     return { success: false, error: 'Invalid PIN', code: 'INVALID_PIN' };
                 }
@@ -1226,44 +1175,54 @@ export class PixaProxyAPI {
             // Update session last activity
             await this.sessionManager.updateSession({ last_pin_unlock: Date.now() });
 
-            // Load keys from vault into session cache
+            // Load keys from PQ sealed storage
             let keysLoaded = false;
-            if (this.keyManager.vaultMaster) {
-                try {
-                    const master = await this.keyManager.vaultMaster.get(normalizedAccount);
-                    if (master && master.derived_keys) {
-                        await this.keyManager.cacheKeys(normalizedAccount, master.derived_keys);
-                        keysLoaded = true;
-                    }
-                } catch (e) {
-                    console.warn('[unlockWithPin] Failed to read master keys from vault:', e.message);
+            try {
+                const sealedCollection = await this.settingsDb.getCollection('sealed_keys');
+                const sealedDoc = await sealedCollection.get(`master_${normalizedAccount}`);
+                if (sealedDoc && sealedDoc.sealed_json) {
+                    const configCollection = await this.settingsDb.getCollection('pq_vault_config');
+                    const saltDoc = await configCollection.get('vault_salt');
+                    const keys = await this.pqVault.unsealKeys(pin, saltDoc.salt, sealedDoc.sealed_json);
+                    await this.keyManager.cacheKeys(normalizedAccount, keys);
+                    keysLoaded = true;
                 }
+            } catch (e) {
+                console.warn('[unlockWithPin] Failed to unseal master keys:', e.message);
             }
 
-            if (!keysLoaded && this.keyManager.vaultIndividual && keyType) {
+            // Try individual sealed keys
+            if (!keysLoaded && keyType) {
                 try {
-                    const indKey = await this.keyManager.vaultIndividual.get(`${normalizedAccount}_${keyType}`);
-                    if (indKey && indKey.key) {
-                        await this.keyManager.addIndividualKey(normalizedAccount, keyType, indKey.key, { storeInVault: false });
+                    const sealedCollection = await this.settingsDb.getCollection('sealed_keys');
+                    const sealedDoc = await sealedCollection.get(`ind_${normalizedAccount}_${keyType}`);
+                    if (sealedDoc && sealedDoc.sealed_json) {
+                        const configCollection = await this.settingsDb.getCollection('pq_vault_config');
+                        const saltDoc = await configCollection.get('vault_salt');
+                        const record = JSON.parse(sealedDoc.sealed_json);
+                        const key = await this.pqVault.unsealSecret(pin, saltDoc.salt, record);
+                        await this.keyManager.addIndividualKey(normalizedAccount, keyType, key, { storeInVault: false });
                         keysLoaded = true;
                     }
                 } catch (e) {
-                    console.warn('[unlockWithPin] Failed to read individual key from vault:', e.message);
+                    console.warn('[unlockWithPin] Failed to unseal individual key:', e.message);
                 }
             }
 
             // Fallback: try the unencrypted collection (keys from quickLogin or
-            // previous sessions that weren't migrated to the vault yet).
-            // Load into in-memory cache only — do NOT attempt vault migration here.
-            // LacertaDB's encrypted vault update/add can fail with TurboSerial
-            // deserialization errors when the vault was opened via fastMode.
-            // Keys will be migrated properly on the next full initializeVault call.
+            // previous sessions that weren't sealed yet).
             if (!keysLoaded && this.keyManager.unencrypted) {
                 try {
                     const hasUnencrypted = await this.keyManager.loadUnencryptedKeys(normalizedAccount);
                     if (hasUnencrypted) {
                         console.debug('[unlockWithPin] Keys loaded from fallback store');
                         keysLoaded = true;
+                        // Seal into PQ vault in the background
+                        const configCollection = await this.settingsDb.getCollection('pq_vault_config');
+                        const saltDoc = await configCollection.get('vault_salt');
+                        if (saltDoc?.salt) {
+                            this._sealKeysToVault(normalizedAccount, pin, saltDoc.salt).catch(() => {});
+                        }
                     }
                 } catch (e) {
                     console.warn('[unlockWithPin] Failed to load unencrypted keys:', e.message);
@@ -1274,6 +1233,7 @@ export class PixaProxyAPI {
                 // PIN was correct but keys could not be loaded — don't claim success
                 this.keyManager.pinVerified = false;
                 this.keyManager.pinVerificationTime = 0;
+                this.pqVault.lock();
                 return { success: false, error: 'Keys not found in vault', code: 'KEYS_NOT_FOUND' };
             }
 
@@ -1284,6 +1244,7 @@ export class PixaProxyAPI {
             return { success: true, account: normalizedAccount };
         } catch (error) {
             console.error('[unlockWithPin] Error:', error);
+            this.pqVault.lock();
             return { success: false, error: error.message || 'Unlock failed', code: 'UNLOCK_FAILED' };
         }
     }
@@ -1441,14 +1402,18 @@ export class PixaProxyAPI {
             await this.keyManager.addIndividualKey(normalizedAccount, keyType, key, { storeInVault: false });
         }
 
-        // If vault is already initialized, also persist keys to the encrypted vault.
+        // If vault is already initialized, also persist keys to the PQ sealed vault.
         // This ensures that PIN unlock can recover them after in-memory cache expiry.
-        if (this.vaultInitialized && this.keyManager.vaultMaster) {
+        if (this.vaultInitialized && this.pqVault) {
             try {
-                await this.keyManager.migrateKeysToVault(normalizedAccount);
-                console.debug('[quickLogin] Keys persisted to vault');
+                const configCollection = await this.settingsDb.getCollection('pq_vault_config');
+                const saltDoc = await configCollection.get('vault_salt');
+                if (saltDoc?.salt) {
+                    await this._sealKeysToVault(normalizedAccount, pin || '', saltDoc.salt);
+                    console.debug('[quickLogin] Keys sealed to PQ vault');
+                }
             } catch (e) {
-                console.warn('[quickLogin] Could not persist keys to vault:', e.message);
+                console.warn('[quickLogin] Could not seal keys to vault:', e.message);
             }
         }
 
@@ -1515,6 +1480,7 @@ export class PixaProxyAPI {
     }
 
     disconnect() {
+        if (this.pqVault) this.pqVault.lock();
         if (this.client && typeof this.client.disconnect === 'function') this.client.disconnect();
     }
 
@@ -1602,8 +1568,88 @@ export class PixaProxyAPI {
     }
 
     async setupVaultCollections() {
-        const vaultCollections = ['master_keys', 'individual_keys', 'sessions'];
-        return this._setupCollectionGroup(this.vaultDb, vaultCollections, 'vault');
+        // v4.0: sealed key blobs live in the settings DB (plain LacertaDB).
+        // Encryption is handled by pixa-vault WASM, not by LacertaDB's DB-level encryption.
+        try { await this.settingsDb.createCollection('sealed_keys'); } catch (e) {}
+        try { await this.settingsDb.createCollection('pq_vault_config'); } catch (e) {}
+    }
+
+    /**
+     * Seal keys from in-memory cache or unencrypted store into the PQ vault.
+     * Stores ChaCha20-Poly1305 encrypted blobs in the sealed_keys collection.
+     *
+     * @param {string} account - Normalized account name
+     * @param {string} pin - Current PIN
+     * @param {string} salt - Hex-encoded vault salt
+     * @private
+     */
+    async _sealKeysToVault(account, pin, salt) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount || !this.pqVault) return;
+
+        const types = ['posting', 'active', 'owner', 'memo'];
+        const keysToSeal = {};
+
+        // Collect keys from all available sources
+        for (const type of types) {
+            // Try session cache
+            const cacheEntry = this.keyManager.sessionKeys.get(`${normalizedAccount}_${type}`);
+            if (cacheEntry) {
+                const decrypted = await this.keyManager._decryptFromCache(cacheEntry);
+                if (decrypted) {
+                    keysToSeal[type] = decrypted;
+                    continue;
+                }
+            }
+
+            // Try unencrypted DB
+            if (this.keyManager.unencrypted) {
+                try {
+                    const doc = await this.keyManager.unencrypted.get(`${normalizedAccount}_${type}`);
+                    if (doc && doc.key) { keysToSeal[type] = doc.key; continue; }
+                } catch (e) {}
+
+                try {
+                    const masterDoc = await this.keyManager.unencrypted.get(normalizedAccount);
+                    if (masterDoc && masterDoc.derived_keys && masterDoc.derived_keys[type]) {
+                        keysToSeal[type] = masterDoc.derived_keys[type];
+                    }
+                } catch (e) {}
+            }
+        }
+
+        if (Object.keys(keysToSeal).length === 0) return;
+
+        // Seal all collected keys via Argon2id + ChaCha20-Poly1305
+        const sealedJson = await this.pqVault.sealKeys(pin, salt, normalizedAccount, keysToSeal);
+
+        // Store in regular LacertaDB collection (content is encrypted, DB is not)
+        try { await this.settingsDb.createCollection('sealed_keys'); } catch (e) {}
+        const sealedCollection = await this.settingsDb.getCollection('sealed_keys');
+
+        try {
+            await sealedCollection.add(
+                { account: normalizedAccount, sealed_json: sealedJson, created_at: Date.now(), version: 1 },
+                { id: `master_${normalizedAccount}` }
+            );
+        } catch (e) {
+            // Already exists — update
+            try {
+                await sealedCollection.update(`master_${normalizedAccount}`, {
+                    sealed_json: sealedJson, updated_at: Date.now(), version: 1
+                });
+            } catch (e2) { /* ignore */ }
+        }
+
+        // SECURITY: Delete plaintext keys from unencrypted store
+        if (this.keyManager.unencrypted) {
+            try { await this.keyManager.unencrypted.delete(normalizedAccount); } catch (e) {}
+            for (const type of types) {
+                try { await this.keyManager.unencrypted.delete(`${normalizedAccount}_${type}`); } catch (e) {}
+            }
+        }
+
+        console.debug(`[_sealKeysToVault] ${Object.keys(keysToSeal).length} keys sealed for ${normalizedAccount}`);
     }
 
     formatAccount(account) {
