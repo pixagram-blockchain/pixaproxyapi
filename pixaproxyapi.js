@@ -187,6 +187,8 @@
  *   - findRcAccounts(accounts)
  *   - getRCMana(account)
  *   - getVPMana(account)
+ *   - calculateRCMana(rcAccount)
+ *   - calculateVPMana(account)
  *   - calculateRCCost(operationType, operationData)
  *
  * communities (CommunitiesAPI):
@@ -2872,11 +2874,11 @@ class FollowAPI {
     async getSubscriptions(account) {
         const normalizedAccount = normalizeAccount(account);
 
-        // No dpixa method exists for subscriptions — use client.call() raw RPC
+        // pixamind.listAllSubscriptions(account) — documented dpixa method
         try {
-            return await this.proxy.client.call('bridge', 'list_all_subscriptions', { account: normalizedAccount });
+            return await this.proxy.client.pixamind.listAllSubscriptions(normalizedAccount);
         } catch (e) {
-            console.warn('[FollowAPI] list_all_subscriptions failed:', e.message);
+            console.warn('[FollowAPI] listAllSubscriptions failed:', e.message);
         }
         return [];
     }
@@ -3971,13 +3973,13 @@ class ResourceCreditsAPI {
     constructor(proxy) { this.proxy = proxy; }
 
     async getResourceParams() {
-        // No dpixa method — client.call() raw RPC
-        return this.proxy.client.call('rc_api', 'get_resource_params', {});
+        // rc.getResourceParams() — documented dpixa method
+        return this.proxy.client.rc.getResourceParams();
     }
 
     async getResourcePool() {
-        // No dpixa method — client.call() raw RPC
-        return this.proxy.client.call('rc_api', 'get_resource_pool', {});
+        // rc.getResourcePool() — documented dpixa method
+        return this.proxy.client.rc.getResourcePool();
     }
 
     async findRcAccounts(accounts) {
@@ -3996,6 +3998,28 @@ class ResourceCreditsAPI {
         const normalizedAccount = normalizeAccount(account);
         // rc.getVPMana(username) — documented dpixa method
         return this.proxy.client.rc.getVPMana(normalizedAccount);
+    }
+
+    /**
+     * Calculate current RC mana from a raw RC account object.
+     * Regenerates mana to current time.
+     * @param {object} rcAccount - RC account object from findRcAccounts()
+     * @returns {object} Manabar { current_mana, max_mana, percentage }
+     */
+    calculateRCMana(rcAccount) {
+        // rc.calculateRCMana(rc_account) — documented dpixa method
+        return this.proxy.client.rc.calculateRCMana(rcAccount);
+    }
+
+    /**
+     * Calculate current voting power mana from a standard account object.
+     * Regenerates mana to current time.
+     * @param {object} account - Account object from getAccounts()
+     * @returns {object} Manabar { current_mana, max_mana, percentage }
+     */
+    calculateVPMana(account) {
+        // rc.calculateVPMana(account) — documented dpixa method
+        return this.proxy.client.rc.calculateVPMana(account);
     }
 
     /**
@@ -4055,9 +4079,9 @@ class CommunitiesAPI {
     }
 
     async listCommunities(options = {}) {
-        // No dpixa method — client.call() raw RPC
+        // pixamind.listCommunities(options) — documented dpixa method
         try {
-            return await this.proxy.client.call('bridge', 'list_communities', {
+            return await this.proxy.client.pixamind.listCommunities({
                 last: options.last || '',
                 limit: options.limit || 100,
                 query: options.query || null,
@@ -4073,9 +4097,9 @@ class CommunitiesAPI {
     async getSubscriptions(account) {
         const normalizedAccount = normalizeAccount(account);
 
-        // No dpixa method — client.call() raw RPC
+        // pixamind.listAllSubscriptions(account) — documented dpixa method
         try {
-            return await this.proxy.client.call('bridge', 'list_all_subscriptions', { account: normalizedAccount });
+            return await this.proxy.client.pixamind.listAllSubscriptions(normalizedAccount);
         } catch (e) {
             console.warn('[CommunitiesAPI] getSubscriptions failed:', e.message);
         }
