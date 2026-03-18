@@ -1,7 +1,7 @@
 /**
  * Pixa Blockchain Proxy API System with LacertaDB
  * Complete API wrapper with organized method groups
- * @version 4.0.0
+ * @version 4.1.0
  *
  * API Groups and Methods:
  *
@@ -48,6 +48,8 @@
  *   - getBlock(blockNum)
  *   - getBlockHeader(blockNum)
  *   - getOpsInBlock(blockNum, onlyVirtual)
+ *   - getBlockRange(startingBlockNum, count)
+ *   - enumVirtualOps(params)
  *
  * globals (GlobalsAPI):
  *   - getDynamicGlobalProperties()
@@ -59,6 +61,9 @@
  *   - getVestingDelegations(account, from, limit)
  *   - getConfig()
  *   - getVersion()
+ *   - getExpiringVestingDelegations(account, afterDate, limit)
+ *   - getConversionRequests(account)
+ *   - getCollateralizedConversionRequests(account)
  *
  * accounts (AccountsAPI):
  *   - getAccounts(accounts, forceRefresh)
@@ -68,6 +73,11 @@
  *   - getAccountHistory(account, from, limit, operationBitmask)
  *   - getAccountReputations(lowerBound, limit)
  *   - getAccountNotifications(account, limit)
+ *   - getEscrow(from, escrowId)
+ *   - findRecurrentTransfers(account)
+ *   - findProposals(ids, order, orderDirection, status, limit)
+ *   - listProposals(start, limit, order, orderDirection, status)
+ *   - listProposalVotes(start, limit, order, orderDirection, status)
  *
  * market (MarketAPI):
  *   - getOrderBook(limit)
@@ -132,7 +142,7 @@
  *   - transferToSavings(from, to, amount, memo)
  *   - transferFromSavings(from, requestId, to, amount, memo)
  *   - cancelTransferFromSavings(from, requestId)
- *   - claimRewardBalance(account, rewardPixa, rewardPxs, rewardVests)
+ *   - claimRewardBalance(account)
  *   - recurrentTransfer(params)
  *   - follow(follower, following)
  *   - unfollow(follower, following)
@@ -150,6 +160,25 @@
  *   - limitOrderCancel(owner, orderId)
  *   - convertPixa(owner, amount, requestId)
  *   - sendOperations(operations, key)
+ *   - accountUpdate(params)
+ *   - claimAccount(creator, fee)
+ *   - createClaimedAccount(params)
+ *   - collateralizedConvert(owner, amount, requestId)
+ *   - limitOrderCreate2(params)
+ *   - feedPublish(publisher, exchangeRate)
+ *   - witnessSetProperties(owner, props)
+ *   - escrowTransfer(params)
+ *   - escrowApprove(params)
+ *   - escrowDispute(params)
+ *   - escrowRelease(params)
+ *   - createProposal(params)
+ *   - updateProposal(params)
+ *   - updateProposalVotes(voter, proposalIds, approve)
+ *   - removeProposal(proposalOwner, proposalIds)
+ *   - requestAccountRecovery(recoveryAccount, accountToRecover, newOwnerAuthority)
+ *   - recoverAccount(accountToRecover, newOwnerAuthority, recentOwnerAuthority)
+ *   - changeRecoveryAccount(accountToRecover, newRecoveryAccount)
+ *   - declineVotingRights(account, decline)
  *
  * auth (AuthAPI):
  *   - isWif(key)
@@ -197,6 +226,28 @@
  *   - getSubscriptions(account)
  *   - getRankedPosts(options)
  *   - getAccountPosts(account, sort, options)
+ *   - getDiscussion(author, permlink, observer)
+ *   - getPost(author, permlink, observer)
+ *   - getPostHeader(author, permlink)
+ *   - getProfile(account, observer)
+ *   - getCommunityContext(name, account)
+ *   - getRelationshipBetweenAccounts(account1, account2)
+ *   - getFollowList(account)
+ *   - doesUserFollowAnyLists(account)
+ *   - getPayoutStats(name)
+ *   - listCommunityRoles(name, last, limit)
+ *   - listSubscribers(name, last, limit)
+ *   - listPopCommunities(limit)
+ *   - setRole(community, account, role)
+ *   - setUserTitle(community, account, title)
+ *   - mutePost(community, account, permlink, notes)
+ *   - unmutePost(community, account, permlink, notes)
+ *   - updateCommunityProps(community, props)
+ *   - subscribe(community)
+ *   - unsubscribe(community)
+ *   - pinPost(community, account, permlink)
+ *   - unpinPost(community, account, permlink)
+ *   - flagPost(community, account, permlink, notes)
  *
  * keys (AccountByKeyAPI):
  *   - getKeyReferences(keys)
@@ -291,7 +342,7 @@ const CONFIG = {
     DEFAULT_NODES: [
         'https://cors-header-proxy-with-api.omnibus-39a.workers.dev'
     ],
-    APP_NAME: 'pixagram/4.0.0',
+    APP_NAME: 'pixagram/4.1.0',
     PAGINATION_LIMIT: 20,
     CHAIN_ID: null,
     ADDRESS_PREFIX: 'PIX',
@@ -787,7 +838,7 @@ export class PixaProxyAPI {
                 console.warn('[PixaProxyAPI] PQ Vault pre-load deferred:', pqErr.message || pqErr);
             }
 
-            console.log('[PixaProxyAPI] Initialized successfully v4.0.0');
+            console.log('[PixaProxyAPI] Initialized successfully v4.1.0');
             return this;
         } catch (error) {
             console.error('[PixaProxyAPI] Initialization failed:', error);
@@ -2186,6 +2237,67 @@ class BlocksAPI {
     async getOpsInBlock(blockNum, onlyVirtual = false) {
         return this.proxy.client.database.getOperations(blockNum, onlyVirtual);
     }
+
+    /**
+     * Retrieve a range of full, signed blocks in a single call.
+     * @param {number} startingBlockNum - First block number (inclusive)
+     * @param {number} count - Maximum number of blocks to return
+     * @returns {Promise<object[]>} Array of signed blocks
+     */
+    async getBlockRange(startingBlockNum, count) {
+        try {
+            const result = await this.proxy.client.call('block_api', 'get_block_range', {
+                starting_block_num: startingBlockNum,
+                count
+            });
+            return result?.blocks || [];
+        } catch (e) {
+            console.warn('[BlocksAPI] get_block_range failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * Enumerate virtual operations within a block range.
+     * Allows filtering by operation type via bitmask.
+     * @param {object} params
+     * @param {number} params.blockRangeBegin - Starting block number (inclusive)
+     * @param {number} params.blockRangeEnd - Ending block number (exclusive)
+     * @param {boolean} [params.includeReversible=false] - Include reversible blocks
+     * @param {boolean} [params.groupByBlock=false] - Group results by block
+     * @param {number} [params.operationBegin=0] - Starting virtual op in block
+     * @param {number} [params.limit=1000] - Max operations to return
+     * @param {number} [params.filter] - Bitmask filter for virtual op types
+     * @returns {Promise<object>} { ops, ops_by_block, next_block_range_begin, next_operation_begin }
+     */
+    async enumVirtualOps(params = {}) {
+        const {
+            blockRangeBegin, blockRangeEnd,
+            includeReversible = false, groupByBlock = false,
+            operationBegin = 0, limit = 1000, filter
+        } = params;
+
+        if (blockRangeBegin === undefined || blockRangeEnd === undefined) {
+            throw new PixaAPIError('blockRangeBegin and blockRangeEnd are required', 'INVALID_PARAMS');
+        }
+
+        const apiParams = {
+            block_range_begin: blockRangeBegin,
+            block_range_end: blockRangeEnd,
+            include_reversible: includeReversible,
+            group_by_block: groupByBlock,
+            operation_begin: operationBegin,
+            limit
+        };
+        if (filter !== undefined) apiParams.filter = filter;
+
+        try {
+            return await this.proxy.client.call('account_history_api', 'enum_virtual_ops', apiParams);
+        } catch (e) {
+            console.warn('[BlocksAPI] enum_virtual_ops failed:', e.message);
+        }
+        return { ops: [] };
+    }
 }
 
 // ============================================
@@ -2229,6 +2341,53 @@ class GlobalsAPI {
 
     async getVersion() {
         return this.proxy.client.database.getVersion();
+    }
+
+    /**
+     * Get vesting delegations that are expiring (returning to delegator)
+     * @param {string} account - Delegator account
+     * @param {string} afterDate - ISO date string to start from
+     * @param {number} limit - Max results
+     * @returns {Promise<object[]>}
+     */
+    async getExpiringVestingDelegations(account, afterDate = '', limit = 100) {
+        const normalizedAccount = normalizeAccount(account);
+        try {
+            return await this.proxy.client.call('condenser_api', 'get_expiring_vesting_delegations', [normalizedAccount, afterDate, limit]);
+        } catch (e) {
+            console.warn('[GlobalsAPI] get_expiring_vesting_delegations failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * Get conversion requests for an account
+     * @param {string} account
+     * @returns {Promise<object[]>}
+     */
+    async getConversionRequests(account) {
+        const normalizedAccount = normalizeAccount(account);
+        try {
+            return await this.proxy.client.call('condenser_api', 'get_conversion_requests', [normalizedAccount]);
+        } catch (e) {
+            console.warn('[GlobalsAPI] get_conversion_requests failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * Get collateralized conversion requests for an account
+     * @param {string} account
+     * @returns {Promise<object[]>}
+     */
+    async getCollateralizedConversionRequests(account) {
+        const normalizedAccount = normalizeAccount(account);
+        try {
+            return await this.proxy.client.call('condenser_api', 'get_collateralized_conversion_requests', [normalizedAccount]);
+        } catch (e) {
+            console.warn('[GlobalsAPI] get_collateralized_conversion_requests failed:', e.message);
+        }
+        return [];
     }
 }
 
@@ -2357,6 +2516,91 @@ class AccountsAPI {
             }
         } catch (e) {
             console.warn('[AccountsAPI] pixamind.getAccountNotifications failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * Get escrow details for an account
+     * @param {string} from - Escrow from account
+     * @param {number} escrowId - Escrow ID
+     * @returns {Promise<object|null>}
+     */
+    async getEscrow(from, escrowId) {
+        const normalizedFrom = normalizeAccount(from);
+        try {
+            return await this.proxy.client.call('condenser_api', 'get_escrow', [normalizedFrom, escrowId]);
+        } catch (e) {
+            console.warn('[AccountsAPI] get_escrow failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Find recurrent transfers for an account
+     * @param {string} account
+     * @returns {Promise<object[]>}
+     */
+    async findRecurrentTransfers(account) {
+        const normalizedAccount = normalizeAccount(account);
+        try {
+            return await this.proxy.client.call('condenser_api', 'find_recurrent_transfers', [normalizedAccount]);
+        } catch (e) {
+            console.warn('[AccountsAPI] find_recurrent_transfers failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * Find proposals (DAO)
+     * @param {Array<string|number>} ids - Proposal IDs or creator accounts
+     * @param {string} order - 'by_creator', 'by_start_date', 'by_end_date', 'by_total_votes'
+     * @param {string} orderDirection - 'ascending' or 'descending'
+     * @param {string} status - 'all', 'inactive', 'active', 'expired', 'votable'
+     * @param {number} limit - Max results
+     * @returns {Promise<object[]>}
+     */
+    async findProposals(ids = [], order = 'by_total_votes', orderDirection = 'descending', status = 'all', limit = 100) {
+        try {
+            return await this.proxy.client.call('condenser_api', 'find_proposals', [ids]);
+        } catch (e) {
+            console.warn('[AccountsAPI] find_proposals failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * List proposals (DAO) with sorting/filtering
+     * @param {Array} start - Start point for iteration
+     * @param {number} limit - Max results
+     * @param {string} order - Sort order
+     * @param {string} orderDirection - 'ascending' or 'descending'
+     * @param {string} status - 'all', 'inactive', 'active', 'expired', 'votable'
+     * @returns {Promise<object[]>}
+     */
+    async listProposals(start = [], limit = 100, order = 'by_total_votes', orderDirection = 'descending', status = 'all') {
+        try {
+            return await this.proxy.client.call('condenser_api', 'list_proposals', [start, limit, order, orderDirection, status]);
+        } catch (e) {
+            console.warn('[AccountsAPI] list_proposals failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * List votes on proposals
+     * @param {Array} start - Start point [proposal_id] or [proposal_id, voter]
+     * @param {number} limit - Max results
+     * @param {string} order - 'by_voter_proposal' or 'by_proposal_voter'
+     * @param {string} orderDirection - 'ascending' or 'descending'
+     * @param {string} status - 'all', 'inactive', 'active', 'expired', 'votable'
+     * @returns {Promise<object[]>}
+     */
+    async listProposalVotes(start = [], limit = 100, order = 'by_proposal_voter', orderDirection = 'ascending', status = 'all') {
+        try {
+            return await this.proxy.client.call('condenser_api', 'list_proposal_votes', [start, limit, order, orderDirection, status]);
+        } catch (e) {
+            console.warn('[AccountsAPI] list_proposal_votes failed:', e.message);
         }
         return [];
     }
@@ -2810,15 +3054,14 @@ class FollowAPI {
         const normalizedAccount = normalizeAccount(account);
         if (!normalizedAccount) return { account: account || '', follower_count: 0, following_count: 0 };
 
-        // database.getAccounts(usernames) — documented dpixa method, always has follower counts
+        // condenser_api.get_follow_count — returns { account, follower_count, following_count }
         try {
-            const accounts = await this.proxy.client.database.getAccounts([normalizedAccount]);
-            if (accounts && accounts[0]) {
-                const acc = accounts[0];
+            const result = await this.proxy.client.call('condenser_api', 'get_follow_count', [normalizedAccount]);
+            if (result) {
                 return {
                     account: normalizedAccount,
-                    follower_count: acc.follower_count || 0,
-                    following_count: acc.following_count || 0
+                    follower_count: result.follower_count || 0,
+                    following_count: result.following_count || 0
                 };
             }
         } catch (e) {
@@ -2874,9 +3117,9 @@ class FollowAPI {
     async getSubscriptions(account) {
         const normalizedAccount = normalizeAccount(account);
 
-        // pixamind.listAllSubscriptions(account) — documented dpixa method
+        // pixamind.listAllSubscriptions({account}) — documented dpixa method
         try {
-            return await this.proxy.client.pixamind.listAllSubscriptions(normalizedAccount);
+            return await this.proxy.client.pixamind.listAllSubscriptions({ account: normalizedAccount });
         } catch (e) {
             console.warn('[FollowAPI] listAllSubscriptions failed:', e.message);
         }
@@ -3257,25 +3500,33 @@ class BroadcastAPI {
      * @param {string} rewardPxs - PXS reward to claim (e.g., "0.500 PXS")
      * @param {string} rewardVests - PXP reward to claim (e.g., "100.000000 PXP")
      */
-    async claimRewardBalance(account, rewardPixa, rewardPxs, rewardVests) {
+    async claimRewardBalance(account) {
         const normalizedAccount = normalizeAccount(account);
 
         if (!normalizedAccount) {
             throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
         }
 
-        // SECURITY FIX (v3.5.2): Validate amount formats before broadcasting
-        if (!VALIDATORS.safe_asset(rewardPixa) || !VALIDATORS.safe_asset(rewardPxs) || !VALIDATORS.safe_asset(rewardVests)) {
-            throw new PixaAPIError('Invalid reward amount format', 'INVALID_AMOUNT');
+        // Fetch the raw (unsanitized) account to get reward balances in chain symbols
+        const [rawAccount] = await this.proxy.client.database.getAccounts([normalizedAccount]);
+        if (!rawAccount) {
+            throw new PixaAPIError('Account not found', 'ACCOUNT_NOT_FOUND');
         }
 
+        const rewardPixa  = rawAccount.reward_pixa_balance  || rawAccount.reward_hive_balance  || '0.000 TESTS';
+        const rewardPxs   = rawAccount.reward_pxs_balance   || rawAccount.reward_hbd_balance   || '0.000 TBD';
+        const rewardVests = rawAccount.reward_vesting_balance || '0.000000 VESTS';
+
         const key = await this.proxy.keyManager.requestKey(normalizedAccount, 'posting');
-        return this.proxy.client.broadcast.claimRewardBalance({
-            account: normalizedAccount,
-            reward_pixa: translateAssetToChain(rewardPixa),
-            reward_pxs: translateAssetToChain(rewardPxs),
-            reward_vests: translateAssetToChain(rewardVests)
-        }, PrivateKey.fromString(key));
+        return this.proxy.client.broadcast.sendOperations(
+            [['claim_reward_balance', {
+                account: normalizedAccount,
+                reward_pixa: rewardPixa,
+                reward_pxs: rewardPxs,
+                reward_vests: rewardVests
+            }]],
+            PrivateKey.fromString(key)
+        );
     }
 
     /**
@@ -3661,6 +3912,470 @@ class BroadcastAPI {
     async sendOperations(operations, key) {
         const privateKey = typeof key === 'string' ? PrivateKey.fromString(key) : key;
         return this.proxy.client.broadcast.sendOperations(operations, privateKey);
+    }
+
+    // ========================================================================
+    // Additional Broadcast Operations (v4.1.0)
+    // ========================================================================
+
+    /**
+     * Update account (v1 — legacy, still used for some authority changes)
+     * @param {object} params
+     */
+    async accountUpdate(params) {
+        const { account, owner, active, posting, memoKey, jsonMetadata = '{}' } = params;
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const requiresOwner = !!owner;
+        const keyType = requiresOwner ? 'owner' : 'active';
+        const key = await this.proxy.keyManager.requestKey(normalizedAccount, keyType);
+
+        const op = { account: normalizedAccount };
+        if (owner) op.owner = owner;
+        if (active) op.active = active;
+        if (posting) op.posting = posting;
+        if (memoKey) op.memo_key = memoKey;
+        op.json_metadata = typeof jsonMetadata === 'string' ? jsonMetadata : JSON.stringify(jsonMetadata);
+
+        return this.proxy.client.broadcast.sendOperations(
+            [['account_update', op]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Claim a discounted account creation token
+     * @param {string} creator - Account claiming the token
+     * @param {string} [fee='0.000 PXA'] - Fee (usually 0 for RC-based claims)
+     * @returns {Promise<object>}
+     */
+    async claimAccount(creator, fee = '0.000 PXA') {
+        const normalizedCreator = normalizeAccount(creator);
+        if (!normalizedCreator) throw new PixaAPIError('Invalid creator', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedCreator, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['claim_account', {
+                creator: normalizedCreator,
+                fee: translateAssetToChain(fee),
+                extensions: []
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Create an account using a previously claimed token
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async createClaimedAccount(params) {
+        const { creator, newAccountName, owner, active, posting, memoKey, jsonMetadata = '{}', extensions = [] } = params;
+        const normalizedCreator = normalizeAccount(creator);
+        const normalizedNew = normalizeAccount(newAccountName);
+        if (!normalizedCreator || !normalizedNew) throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedCreator, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['create_claimed_account', {
+                creator: normalizedCreator,
+                new_account_name: normalizedNew,
+                owner, active, posting,
+                memo_key: memoKey,
+                json_metadata: typeof jsonMetadata === 'string' ? jsonMetadata : JSON.stringify(jsonMetadata),
+                extensions
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Collateralized convert (convert PIXA to PXS with PIXA collateral)
+     * @param {string} owner
+     * @param {string} amount - Amount to convert
+     * @param {number} requestId
+     * @returns {Promise<object>}
+     */
+    async collateralizedConvert(owner, amount, requestId) {
+        const normalizedOwner = normalizeAccount(owner);
+        if (!normalizedOwner) throw new PixaAPIError('Invalid owner', 'INVALID_ACCOUNT');
+        if (!VALIDATORS.safe_asset(amount)) throw new PixaAPIError('Invalid amount format', 'INVALID_AMOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedOwner, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['collateralized_convert', {
+                owner: normalizedOwner,
+                requestid: requestId,
+                amount: translateAssetToChain(amount)
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Create limit order (v2 — uses exchange_rate instead of min_to_receive)
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async limitOrderCreate2(params) {
+        const { owner, orderId, amountToSell, exchangeRate, fillOrKill = false, expiration } = params;
+        const normalizedOwner = normalizeAccount(owner);
+        if (!normalizedOwner) throw new PixaAPIError('Invalid owner', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedOwner, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['limit_order_create2', {
+                owner: normalizedOwner,
+                orderid: orderId,
+                amount_to_sell: translateAssetToChain(amountToSell),
+                exchange_rate: exchangeRate,
+                fill_or_kill: fillOrKill,
+                expiration: expiration || new Date(Date.now() + 28 * 24 * 60 * 60 * 1000).toISOString().slice(0, -5)
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Publish a price feed (witnesses only)
+     * @param {string} publisher - Witness account
+     * @param {object} exchangeRate - { base: "0.500 PXS", quote: "1.000 PIXA" }
+     * @returns {Promise<object>}
+     */
+    async feedPublish(publisher, exchangeRate) {
+        const normalizedPublisher = normalizeAccount(publisher);
+        if (!normalizedPublisher) throw new PixaAPIError('Invalid publisher', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedPublisher, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['feed_publish', {
+                publisher: normalizedPublisher,
+                exchange_rate: {
+                    base: translateAssetToChain(exchangeRate.base),
+                    quote: translateAssetToChain(exchangeRate.quote)
+                }
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Set witness properties (modern witness configuration)
+     * @param {string} owner - Witness account
+     * @param {object} props - Property key-value pairs
+     * @returns {Promise<object>}
+     */
+    async witnessSetProperties(owner, props) {
+        const normalizedOwner = normalizeAccount(owner);
+        if (!normalizedOwner) throw new PixaAPIError('Invalid owner', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedOwner, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['witness_set_properties', {
+                owner: normalizedOwner,
+                props,
+                extensions: []
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    // --- Escrow Operations ---
+
+    /**
+     * Initiate an escrow transfer
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async escrowTransfer(params) {
+        const { from, to, agent, escrowId, pxsFee, pixaFee, ratificationDeadline, escrowExpiration, jsonMeta = '{}', amount } = params;
+        const normalizedFrom = normalizeAccount(from);
+        const normalizedTo = normalizeAccount(to);
+        const normalizedAgent = normalizeAccount(agent);
+        if (!normalizedFrom || !normalizedTo || !normalizedAgent) throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedFrom, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['escrow_transfer', {
+                from: normalizedFrom,
+                to: normalizedTo,
+                agent: normalizedAgent,
+                escrow_id: escrowId,
+                hbd_amount: translateAssetToChain(pxsFee || '0.000 PXS'),
+                hive_amount: translateAssetToChain(amount || '0.000 PXA'),
+                fee: translateAssetToChain(pixaFee || '0.000 PXA'),
+                ratification_deadline: ratificationDeadline,
+                escrow_expiration: escrowExpiration,
+                json_meta: typeof jsonMeta === 'string' ? jsonMeta : JSON.stringify(jsonMeta)
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Approve an escrow transaction
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async escrowApprove(params) {
+        const { from, to, agent, who, escrowId, approve = true } = params;
+        const normalizedWho = normalizeAccount(who);
+        if (!normalizedWho) throw new PixaAPIError('Invalid who parameter', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedWho, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['escrow_approve', {
+                from: normalizeAccount(from),
+                to: normalizeAccount(to),
+                agent: normalizeAccount(agent),
+                who: normalizedWho,
+                escrow_id: escrowId,
+                approve
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Dispute an escrow
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async escrowDispute(params) {
+        const { from, to, agent, who, escrowId } = params;
+        const normalizedWho = normalizeAccount(who);
+        if (!normalizedWho) throw new PixaAPIError('Invalid who parameter', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedWho, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['escrow_dispute', {
+                from: normalizeAccount(from),
+                to: normalizeAccount(to),
+                agent: normalizeAccount(agent),
+                who: normalizedWho,
+                escrow_id: escrowId
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Release funds from escrow
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async escrowRelease(params) {
+        const { from, to, agent, who, receiver, escrowId, pxsAmount, pixaAmount } = params;
+        const normalizedWho = normalizeAccount(who);
+        if (!normalizedWho) throw new PixaAPIError('Invalid who parameter', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedWho, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['escrow_release', {
+                from: normalizeAccount(from),
+                to: normalizeAccount(to),
+                agent: normalizeAccount(agent),
+                who: normalizedWho,
+                receiver: normalizeAccount(receiver),
+                escrow_id: escrowId,
+                hbd_amount: translateAssetToChain(pxsAmount || '0.000 PXS'),
+                hive_amount: translateAssetToChain(pixaAmount || '0.000 PXA')
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    // --- Proposal / DAO Operations ---
+
+    /**
+     * Create a proposal (DAO)
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async createProposal(params) {
+        const { creator, receiver, startDate, endDate, dailyPay, subject, permlink, extensions = [] } = params;
+        const normalizedCreator = normalizeAccount(creator);
+        const normalizedReceiver = normalizeAccount(receiver);
+        if (!normalizedCreator || !normalizedReceiver) throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedCreator, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['create_proposal', {
+                creator: normalizedCreator,
+                receiver: normalizedReceiver,
+                start_date: startDate,
+                end_date: endDate,
+                daily_pay: translateAssetToChain(dailyPay),
+                subject,
+                permlink,
+                extensions
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Update an existing proposal
+     * @param {object} params
+     * @returns {Promise<object>}
+     */
+    async updateProposal(params) {
+        const { proposalId, creator, dailyPay, subject, permlink, endDate, extensions = [] } = params;
+        const normalizedCreator = normalizeAccount(creator);
+        if (!normalizedCreator) throw new PixaAPIError('Invalid creator', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedCreator, 'active');
+        const op = {
+            proposal_id: proposalId,
+            creator: normalizedCreator,
+            extensions
+        };
+        if (dailyPay) op.daily_pay = translateAssetToChain(dailyPay);
+        if (subject) op.subject = subject;
+        if (permlink) op.permlink = permlink;
+        if (endDate) op.end_date = endDate;
+
+        return this.proxy.client.broadcast.sendOperations(
+            [['update_proposal', op]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Vote on proposals (approve or unapprove)
+     * @param {string} voter
+     * @param {number[]} proposalIds - Array of proposal IDs
+     * @param {boolean} approve - true to approve, false to remove approval
+     * @returns {Promise<object>}
+     */
+    async updateProposalVotes(voter, proposalIds, approve = true) {
+        const normalizedVoter = normalizeAccount(voter);
+        if (!normalizedVoter) throw new PixaAPIError('Invalid voter', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedVoter, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['update_proposal_votes', {
+                voter: normalizedVoter,
+                proposal_ids: proposalIds,
+                approve,
+                extensions: []
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Remove a proposal
+     * @param {string} proposalOwner
+     * @param {number[]} proposalIds - Array of proposal IDs to remove
+     * @returns {Promise<object>}
+     */
+    async removeProposal(proposalOwner, proposalIds) {
+        const normalizedOwner = normalizeAccount(proposalOwner);
+        if (!normalizedOwner) throw new PixaAPIError('Invalid owner', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedOwner, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['remove_proposal', {
+                proposal_owner: normalizedOwner,
+                proposal_ids: proposalIds,
+                extensions: []
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    // --- Account Recovery Operations ---
+
+    /**
+     * Request account recovery
+     * @param {string} recoveryAccount - The account's recovery partner
+     * @param {string} accountToRecover - Account being recovered
+     * @param {object} newOwnerAuthority - New owner authority object
+     * @returns {Promise<object>}
+     */
+    async requestAccountRecovery(recoveryAccount, accountToRecover, newOwnerAuthority) {
+        const normalizedRecovery = normalizeAccount(recoveryAccount);
+        const normalizedTarget = normalizeAccount(accountToRecover);
+        if (!normalizedRecovery || !normalizedTarget) throw new PixaAPIError('Invalid account parameters', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedRecovery, 'active');
+        return this.proxy.client.broadcast.sendOperations(
+            [['request_account_recovery', {
+                recovery_account: normalizedRecovery,
+                account_to_recover: normalizedTarget,
+                new_owner_authority: newOwnerAuthority,
+                extensions: []
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Complete account recovery (must be done within 24h of request)
+     * @param {string} accountToRecover
+     * @param {object} newOwnerAuthority
+     * @param {object} recentOwnerAuthority
+     * @returns {Promise<object>}
+     */
+    async recoverAccount(accountToRecover, newOwnerAuthority, recentOwnerAuthority) {
+        const normalizedTarget = normalizeAccount(accountToRecover);
+        if (!normalizedTarget) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        // Recovery uses the NEW owner key
+        const key = await this.proxy.keyManager.requestKey(normalizedTarget, 'owner');
+        return this.proxy.client.broadcast.sendOperations(
+            [['recover_account', {
+                account_to_recover: normalizedTarget,
+                new_owner_authority: newOwnerAuthority,
+                recent_owner_authority: recentOwnerAuthority,
+                extensions: []
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Change account's recovery partner
+     * @param {string} accountToRecover
+     * @param {string} newRecoveryAccount
+     * @returns {Promise<object>}
+     */
+    async changeRecoveryAccount(accountToRecover, newRecoveryAccount) {
+        const normalizedTarget = normalizeAccount(accountToRecover);
+        const normalizedRecovery = normalizeAccount(newRecoveryAccount);
+        if (!normalizedTarget) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedTarget, 'owner');
+        return this.proxy.client.broadcast.sendOperations(
+            [['change_recovery_account', {
+                account_to_recover: normalizedTarget,
+                new_recovery_account: normalizedRecovery || '',
+                extensions: []
+            }]],
+            PrivateKey.fromString(key)
+        );
+    }
+
+    /**
+     * Decline voting rights (irreversible)
+     * @param {string} account
+     * @param {boolean} decline - true to decline, false to cancel (within timelock)
+     * @returns {Promise<object>}
+     */
+    async declineVotingRights(account, decline = true) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const key = await this.proxy.keyManager.requestKey(normalizedAccount, 'owner');
+        return this.proxy.client.broadcast.sendOperations(
+            [['decline_voting_rights', {
+                account: normalizedAccount,
+                decline
+            }]],
+            PrivateKey.fromString(key)
+        );
     }
 }
 
@@ -4097,9 +4812,9 @@ class CommunitiesAPI {
     async getSubscriptions(account) {
         const normalizedAccount = normalizeAccount(account);
 
-        // pixamind.listAllSubscriptions(account) — documented dpixa method
+        // pixamind.listAllSubscriptions({account}) — documented dpixa method
         try {
-            return await this.proxy.client.pixamind.listAllSubscriptions(normalizedAccount);
+            return await this.proxy.client.pixamind.listAllSubscriptions({ account: normalizedAccount });
         } catch (e) {
             console.warn('[CommunitiesAPI] getSubscriptions failed:', e.message);
         }
@@ -4224,6 +4939,458 @@ class CommunitiesAPI {
         // SECURITY PATCH (v3.5.2-patched): FAIL-CLOSED
         console.error('[CommunitiesAPI] Sanitizer pipeline not available — refusing to serve raw content');
         return [];
+    }
+
+    // ========================================================================
+    // Bridge API — Additional Methods (v4.1.0)
+    // ========================================================================
+
+    /**
+     * Get a full discussion thread (post + all nested comments)
+     * @param {string} author - Post author
+     * @param {string} permlink - Post permlink
+     * @param {string} [observer=''] - Observer account for personalization
+     * @returns {Promise<object>} Full discussion tree
+     */
+    async getDiscussion(author, permlink, observer = '') {
+        const normalizedAuthor = normalizeAccount(author);
+        if (!normalizedAuthor) return null;
+
+        try {
+            return await this.proxy.client.call('bridge', 'get_discussion', {
+                author: normalizedAuthor,
+                permlink,
+                observer
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_discussion failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Get a single post via Bridge (richer format than condenser_api.get_content)
+     * @param {string} author - Post author
+     * @param {string} permlink - Post permlink
+     * @param {string} [observer=''] - Observer account
+     * @returns {Promise<object|null>}
+     */
+    async getPost(author, permlink, observer = '') {
+        const normalizedAuthor = normalizeAccount(author);
+        if (!normalizedAuthor) return null;
+
+        try {
+            return await this.proxy.client.call('bridge', 'get_post', {
+                author: normalizedAuthor,
+                permlink,
+                observer
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_post failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Get lightweight post header (no body or votes)
+     * @param {string} author
+     * @param {string} permlink
+     * @returns {Promise<object|null>}
+     */
+    async getPostHeader(author, permlink) {
+        const normalizedAuthor = normalizeAccount(author);
+        if (!normalizedAuthor) return null;
+
+        try {
+            return await this.proxy.client.call('bridge', 'get_post_header', {
+                author: normalizedAuthor,
+                permlink
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_post_header failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Get profile data via Bridge (includes computed reputation, follower counts)
+     * @param {string} account
+     * @param {string} [observer=''] - Observer account
+     * @returns {Promise<object|null>}
+     */
+    async getProfile(account, observer = '') {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return null;
+
+        try {
+            return await this.proxy.client.call('bridge', 'get_profile', {
+                account: normalizedAccount,
+                observer
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_profile failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Get user's context within a community (role, title, subscription status)
+     * @param {string} name - Community name (e.g. "hive-123456")
+     * @param {string} account - Account to check
+     * @returns {Promise<object|null>} { role, title, subscribed }
+     */
+    async getCommunityContext(name, account) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return null;
+
+        try {
+            return await this.proxy.client.call('bridge', 'get_community_context', {
+                name,
+                account: normalizedAccount
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_community_context failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Get the follow/mute relationship between two accounts
+     * @param {string} account1
+     * @param {string} account2
+     * @returns {Promise<object|null>} { follows, ignores, blacklists, follow_blacklists }
+     */
+    async getRelationshipBetweenAccounts(account1, account2) {
+        const normalized1 = normalizeAccount(account1);
+        const normalized2 = normalizeAccount(account2);
+        if (!normalized1 || !normalized2) return null;
+
+        try {
+            return await this.proxy.client.call('bridge', 'get_relationship_between_accounts', [normalized1, normalized2]);
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_relationship_between_accounts failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Get follow list (blacklist/mute list) for an account
+     * @param {string} account
+     * @returns {Promise<object|null>}
+     */
+    async getFollowList(account) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return null;
+
+        try {
+            return await this.proxy.client.call('bridge', 'get_follow_list', {
+                account: normalizedAccount
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_follow_list failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * Check if a user follows any blacklists/mute lists
+     * @param {string} account
+     * @returns {Promise<boolean>}
+     */
+    async doesUserFollowAnyLists(account) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) return false;
+
+        try {
+            return await this.proxy.client.call('bridge', 'does_user_follow_any_lists', {
+                account: normalizedAccount
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.does_user_follow_any_lists failed:', e.message);
+        }
+        return false;
+    }
+
+    /**
+     * Get payout statistics for a community
+     * @param {string} name - Community name
+     * @returns {Promise<object|null>}
+     */
+    async getPayoutStats(name) {
+        try {
+            return await this.proxy.client.call('bridge', 'get_payout_stats', { community: name });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.get_payout_stats failed:', e.message);
+        }
+        return null;
+    }
+
+    /**
+     * List roles assigned within a community
+     * @param {string} name - Community name
+     * @param {string} [last=''] - Last account for pagination
+     * @param {number} [limit=100]
+     * @returns {Promise<object[]>} Array of [account, role, title]
+     */
+    async listCommunityRoles(name, last = '', limit = 100) {
+        try {
+            return await this.proxy.client.call('bridge', 'list_community_roles', {
+                community: name,
+                last,
+                limit
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.list_community_roles failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * List subscribers to a community
+     * @param {string} name - Community name
+     * @param {string} [last=''] - Last account for pagination
+     * @param {number} [limit=100]
+     * @returns {Promise<object[]>} Array of [account, role, title, created]
+     */
+    async listSubscribers(name, last = '', limit = 100) {
+        try {
+            return await this.proxy.client.call('bridge', 'list_subscribers', {
+                community: name,
+                last,
+                limit
+            });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.list_subscribers failed:', e.message);
+        }
+        return [];
+    }
+
+    /**
+     * List popular communities (alternative ranking)
+     * @param {number} [limit=25]
+     * @returns {Promise<object[]>}
+     */
+    async listPopCommunities(limit = 25) {
+        try {
+            return await this.proxy.client.call('bridge', 'list_pop_communities', { limit });
+        } catch (e) {
+            console.warn('[CommunitiesAPI] bridge.list_pop_communities failed:', e.message);
+        }
+        return [];
+    }
+
+    // ========================================================================
+    // Community Broadcast Convenience Methods (custom_json wrappers) (v4.1.0)
+    // ========================================================================
+
+    /**
+     * Set a role for an account within a community
+     * @param {string} community - Community name (e.g. "hive-123456")
+     * @param {string} account - Account to assign role to
+     * @param {string} role - Role: 'admin', 'mod', 'member', 'guest', 'muted'
+     * @returns {Promise<object>} TransactionConfirmation
+     */
+    async setRole(community, account, role) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        // Requires the authority of whoever is setting the role
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['setRole', { community, account: normalizedAccount, role }])
+        });
+    }
+
+    /**
+     * Set a title/badge for an account within a community (Mods or higher)
+     * @param {string} community
+     * @param {string} account
+     * @param {string} title - Badge/title text
+     * @returns {Promise<object>}
+     */
+    async setUserTitle(community, account, title) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['setUserTitle', { community, account: normalizedAccount, title }])
+        });
+    }
+
+    /**
+     * Mute a post within a community (Mods or higher)
+     * @param {string} community
+     * @param {string} account - Author of the post
+     * @param {string} permlink
+     * @param {string} notes - Reason for muting (use 'spam' for spam)
+     * @returns {Promise<object>}
+     */
+    async mutePost(community, account, permlink, notes = '') {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['mutePost', { community, account: normalizedAccount, permlink, notes }])
+        });
+    }
+
+    /**
+     * Unmute a post within a community (Mods or higher)
+     * @param {string} community
+     * @param {string} account
+     * @param {string} permlink
+     * @param {string} notes
+     * @returns {Promise<object>}
+     */
+    async unmutePost(community, account, permlink, notes = '') {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['unmutePost', { community, account: normalizedAccount, permlink, notes }])
+        });
+    }
+
+    /**
+     * Update community properties (Admin only)
+     * @param {string} community
+     * @param {object} props - { title, about, is_nsfw, description, flag_text }
+     * @returns {Promise<object>}
+     */
+    async updateCommunityProps(community, props) {
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['updateProps', { community, props }])
+        });
+    }
+
+    /**
+     * Subscribe to a community
+     * @param {string} community
+     * @returns {Promise<object>}
+     */
+    async subscribe(community) {
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['subscribe', { community }])
+        });
+    }
+
+    /**
+     * Unsubscribe from a community
+     * @param {string} community
+     * @returns {Promise<object>}
+     */
+    async unsubscribe(community) {
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['unsubscribe', { community }])
+        });
+    }
+
+    /**
+     * Pin a post to the top of the community homepage (Mods or higher)
+     * @param {string} community
+     * @param {string} account - Post author
+     * @param {string} permlink
+     * @returns {Promise<object>}
+     */
+    async pinPost(community, account, permlink) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['pinPost', { community, account: normalizedAccount, permlink }])
+        });
+    }
+
+    /**
+     * Unpin a post from the community homepage (Mods or higher)
+     * @param {string} community
+     * @param {string} account
+     * @param {string} permlink
+     * @returns {Promise<object>}
+     */
+    async unpinPost(community, account, permlink) {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['unpinPost', { community, account: normalizedAccount, permlink }])
+        });
+    }
+
+    /**
+     * Flag a post for community review (any user)
+     * @param {string} community
+     * @param {string} account - Post author
+     * @param {string} permlink
+     * @param {string} notes - Reason for flagging
+     * @returns {Promise<object>}
+     */
+    async flagPost(community, account, permlink, notes = '') {
+        const normalizedAccount = normalizeAccount(account);
+        if (!normalizedAccount) throw new PixaAPIError('Invalid account', 'INVALID_ACCOUNT');
+
+        const activeUser = this.proxy.sessionManager?.currentAccount;
+        if (!activeUser) throw new PixaAPIError('No active session', 'NO_SESSION');
+
+        return this.proxy.broadcast.customJson({
+            requiredAuths: [],
+            requiredPostingAuths: [activeUser],
+            id: 'community',
+            json: JSON.stringify(['flagPost', { community, account: normalizedAccount, permlink, notes }])
+        });
     }
 }
 
